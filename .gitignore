@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Output artifacts (generated videos, audio, images)
+output/
+temp/
+
+# Asset caches (downloaded music, media)
+assets/media_cache/
+assets/music_cache/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# MoviePy temp files
+*TEMP_MPY_wvf_snd*
+
+# Test artifacts
+test_tts_*.mp3
