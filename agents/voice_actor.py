@@ -45,7 +45,7 @@ class VoiceActor:
 
     async def _synthesize(self, text, output_path, rate="+0%", volume="+0%", pitch="+0Hz"):
         # 尝试主声音，失败时回退到备用声音
-        voices = [self.voice, "zh-CN-YunjianNeural", "zh-CN-XiaoxiaoNeural"]
+        voices = [self.voice, "zh-CN-YunjianNeural", "zh-CN-YunxiNeural"]
         for voice in voices:
             try:
                 communicate = edge_tts.Communicate(

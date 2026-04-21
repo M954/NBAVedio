@@ -423,7 +423,7 @@ class TweetVideoAgent:
             bgm_audio = bgm_raw.with_duration(actual_duration)
 
         if tts_parts:
-            bgm_quiet = bgm_audio.with_effects([afx.MultiplyVolume(0.2)])
+            bgm_quiet = bgm_audio.with_effects([afx.MultiplyVolume(0.08)])
             mixed = CompositeAudioClip([bgm_quiet] + tts_parts)
             mixed = mixed.with_duration(actual_duration)
             video = video.with_audio(mixed)
