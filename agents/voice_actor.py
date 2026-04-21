@@ -6,12 +6,6 @@ import time
 import wave
 import edge_tts
 
-try:
-    import nest_asyncio
-    nest_asyncio.apply()
-except ImportError:
-    pass
-
 
 class VoiceActor:
     """使用 edge-tts 将文本转为语音"""
@@ -29,16 +23,9 @@ class VoiceActor:
         return self._loop
 
     def _run_async(self, coro):
-        """在事件循环中执行协程，兼容 uvicorn 的 async 环境"""
-        import concurrent.futures
-        try:
-            asyncio.get_running_loop()
-            # 已有 running loop（uvicorn 环境），在新线程里跑避免冲突
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                return pool.submit(asyncio.run, coro).result(timeout=30)
-        except RuntimeError:
-            # 没有 running loop
-            return asyncio.run(coro)
+        """在事件循环中执行协程"""
+        loop = self._get_loop()
+        return loop.run_until_complete(coro)
 
     @staticmethod
     def _sanitize_for_tts(text):
