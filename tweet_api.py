@@ -555,6 +555,7 @@ def _do_generate_ai_inner(saved_paths, saved_video_path, trans_list, author_list
             "bgm_song": cur_song or "合成音乐",
             "mood": mood,
             "has_narration": True,
+            "has_source_video": saved_video_path is not None,
             "duration": round(clip.duration, 1),
             "resolution": f"{clip.size[0]}x{clip.size[1]}",
             "has_audio": clip.audio is not None,
@@ -563,7 +564,7 @@ def _do_generate_ai_inner(saved_paths, saved_video_path, trans_list, author_list
         clip.close()
 
         try:
-            review = ai.review_video(info)
+            review = ai.review_video(info, video_path=video_path)
         except Exception as e:
             review = {"score": 70, "grade": "C", "suggestions": [str(e)]}
 

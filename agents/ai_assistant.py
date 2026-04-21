@@ -27,6 +27,60 @@ class _BaseAssistant:
     def _call(self, prompt, system="你是一个专业的NBA篮球内容编辑和翻译。"):
         raise NotImplementedError
 
+    @staticmethod
+    def _analyze_video_frames(video_path):
+        """从视频中提取关键帧并分析，生成文字描述供 AI 评分。"""
+        try:
+            from moviepy import VideoFileClip
+            from PIL import Image
+            import numpy as np
+
+            clip = VideoFileClip(video_path)
+            dur = clip.duration
+            analysis = []
+            analysis.append(f"视频总时长: {dur:.1f}秒, 分辨率: {clip.size[0]}x{clip.size[1]}, FPS: {clip.fps}")
+
+            # 抽取5个时间点的帧
+            times = [0.5, dur * 0.25, dur * 0.5, dur * 0.75, max(dur - 1, 0.5)]
+            for i, t in enumerate(times):
+                if t >= dur:
+                    continue
+                frame = clip.get_frame(min(t, dur - 0.1))
+                img = Image.fromarray(frame)
+                w, h = img.size
+
+                # 分析帧特征
+                arr = np.array(img)
+                brightness = int(arr.mean())
+                # 检查上半部分和下半部分的亮度差（判断是否有字幕区域）
+                top_brightness = int(arr[:h//2].mean())
+                bottom_brightness = int(arr[h//2:].mean())
+                # 检查是否主要是暗色背景
+                dark_ratio = int((arr < 40).mean() * 100)
+
+                desc = f"帧{i+1} ({t:.1f}s): 亮度={brightness}"
+                if dark_ratio > 50:
+                    desc += ", 暗色背景为主"
+                if abs(top_brightness - bottom_brightness) > 30:
+                    desc += f", 上下亮度差={top_brightness - bottom_brightness}(可能有字幕)"
+                if t < 3:
+                    desc += ", 开头画面"
+                elif t > dur - 2:
+                    desc += ", 结尾画面"
+
+                analysis.append(desc)
+
+            # 音频分析
+            if clip.audio:
+                analysis.append(f"有音频轨道, 音频时长: {clip.audio.duration:.1f}秒")
+            else:
+                analysis.append("无音频轨道")
+
+            clip.close()
+            return "\n".join(analysis)
+        except Exception as e:
+            return f"视频分析失败: {e}"
+
     def polish_translation(self, original_text, raw_translation):
         """优化翻译，使其更自然流畅、适合短视频展示"""
         prompt = (
@@ -114,10 +168,16 @@ class _BaseAssistant:
             return result
         return "chill"
 
-    def review_video(self, video_info):
-        """审阅推特短视频质量"""
+    def review_video(self, video_info, video_path=None):
+        """审阅推特短视频质量。如果提供 video_path，会分析视频帧。"""
+        # 从视频中提取详细信息
+        frame_analysis = ""
+        if video_path and os.path.exists(video_path):
+            frame_analysis = self._analyze_video_frames(video_path)
+
         prompt = (
             f"你是一个严格的短视频审阅员。请审阅以下推特短视频：\n\n"
+            f"=== 视频元信息 ===\n"
             f"解说词: {video_info.get('commentary', '')}\n"
             f"翻译文本: {video_info.get('translation', '')}\n"
             f"作者: {video_info.get('author', '')}\n"
@@ -127,25 +187,23 @@ class _BaseAssistant:
             f"时长: {video_info.get('duration', 0)}秒\n"
             f"分辨率: {video_info.get('resolution', '')}\n"
             f"有音频: {video_info.get('has_audio', False)}\n"
-            f"文件大小: {video_info.get('file_size_mb', 0)}MB\n\n"
+            f"文件大小: {video_info.get('file_size_mb', 0)}MB\n"
+            f"有原始推文视频: {video_info.get('has_source_video', False)}\n\n"
+        )
+        if frame_analysis:
+            prompt += f"=== 视频帧分析 ===\n{frame_analysis}\n\n"
+
+        prompt += (
             f"严格评分标准（满分100，90分以上才算A级合格）：\n"
-            f"1. 解说质量（30分）：\n"
-            f"   - 是否像解说员而非简单念翻译（10分）\n"
-            f"   - 是否解读了推文行为（转发/引用/回复/原创）和态度（支持/反对/调侃）（10分）\n"
-            f"   - 是否补充了背景信息（球员关系、事件背景）（10分）\n"
-            f"   ※ 如果解说词只是翻译的简单改写没有解读，最高只给10分\n"
-            f"2. 配乐质量（25分）：\n"
-            f"   - 是否使用了真实歌曲而非合成音（15分）\n"
-            f"   - 歌曲风格是否与推文情绪匹配（10分）\n"
-            f"   ※ 使用合成音乐（sine wave）最高只给5分\n"
-            f"3. 配音效果（15分）：语音自然流畅，配音和配乐是否分层清晰\n"
-            f"4. 页面简洁（10分）：无多余文字/标签，排版干净\n"
-            f"5. 内容趣味（15分）：是否让人想看完，有没有信息增量\n"
-            f"6. 技术质量（5分）：时长合理、分辨率、音画同步\n\n"
-            f"请严格按以下JSON格式返回（不要添加markdown或其他内容）：\n"
+            f"1. 解说质量（30分）：是否像博主聊天而非念稿，是否解读了推文含义，是否有背景补充\n"
+            f"2. 配乐质量（20分）：是否用了真实歌曲（合成音最高5分），风格是否匹配\n"
+            f"3. 配音效果（15分）：语音自然度，与配乐分层是否清晰\n"
+            f"4. 视觉效果（20分）：画面清晰度，截图→视频过渡是否流畅，字幕位置是否合理\n"
+            f"5. 内容趣味（15分）：是否让人想看完，有没有信息增量\n\n"
+            f"请严格按以下JSON格式返回：\n"
             f'{{"score": 85, "grade": "B", '
-            f'"details": {{"解说质量": 20, "配乐质量": 15, "配音效果": 12, "页面简洁": 8, "内容趣味": 13, "技术质量": 5}}, '
-            f'"suggestions": ["建议1", "建议2"]}}'
+            f'"details": {{"解说质量": 20, "配乐质量": 15, "配音效果": 12, "视觉效果": 16, "内容趣味": 13}}, '
+            f'"suggestions": ["具体建议1", "具体建议2"]}}'
         )
         system = "你是专业短视频审阅员。必须以纯JSON格式返回结果，不要包含markdown代码块标记。"
         result = self._call(prompt, system=system)
