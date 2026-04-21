@@ -30,12 +30,12 @@ class VoiceActor:
 
     def _run_async(self, coro):
         """在事件循环中执行协程，兼容 uvicorn 的 async 环境"""
+        import concurrent.futures
         try:
-            loop = asyncio.get_running_loop()
-            # 已有 running loop（uvicorn 环境），用 nest_asyncio 允许嵌套
-            import nest_asyncio
-            nest_asyncio.apply(loop)
-            return loop.run_until_complete(coro)
+            asyncio.get_running_loop()
+            # 已有 running loop（uvicorn 环境），在新线程里跑避免冲突
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                return pool.submit(asyncio.run, coro).result(timeout=30)
         except RuntimeError:
             # 没有 running loop
             return asyncio.run(coro)

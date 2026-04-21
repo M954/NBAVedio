@@ -21,7 +21,8 @@ class _BaseAssistant:
     def _log(self, msg, level="info"):
         if self._logger:
             self._logger(msg, level)
-        print(f"  [AI] [{level}] {msg}")
+        else:
+            print(f"  [AI] [{level}] {msg}")
 
     def _call(self, prompt, system="你是一个专业的NBA篮球内容编辑和翻译。"):
         raise NotImplementedError

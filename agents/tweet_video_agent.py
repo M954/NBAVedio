@@ -342,12 +342,35 @@ class TweetVideoAgent:
                 output_name=bgm_name,
             )
 
-        # 3. 生成背景（有推文视频时用视频，否则用截图静态帧）
+        # 3. 生成背景
         frame_path = None
+        INTRO_DUR = 2.5  # 截图开场时长
         if source_video and os.path.exists(source_video):
             print(f"  [Video] 使用推文自带视频: {source_video}")
-            bg_clip = self._create_video_clip(source_video, target_duration=actual_duration)
-            bg_clip = bg_clip.with_effects([vfx.FadeIn(0.5), vfx.FadeOut(0.5)])
+            # 截图开场 → 淡入推文视频
+            frame = self._create_frame(images[0], "", authors[0] if authors else "")
+            frame_path = os.path.join(self.output_dir, "frame_0.png")
+            frame.save(frame_path, quality=95)
+
+            intro_clip = (
+                ImageClip(frame_path)
+                .with_duration(INTRO_DUR)
+                .with_effects([vfx.FadeIn(0.5), vfx.FadeOut(0.5)])
+            )
+
+            video_dur = max(actual_duration - INTRO_DUR, 5.0)
+            video_clip = self._create_video_clip(source_video, target_duration=video_dur)
+            video_clip = (
+                video_clip
+                .with_start(INTRO_DUR)
+                .with_effects([vfx.FadeIn(0.8), vfx.FadeOut(0.5)])
+            )
+
+            actual_duration = INTRO_DUR + video_dur
+            bg_clip = CompositeVideoClip(
+                [intro_clip, video_clip],
+                size=(WIDTH, HEIGHT),
+            ).with_duration(actual_duration)
         else:
             frame = self._create_frame(images[0], "", authors[0] if authors else "")
             frame_path = os.path.join(self.output_dir, "frame_0.png")
