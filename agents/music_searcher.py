@@ -5,17 +5,20 @@ import json
 import uuid
 
 
-# moviepy 内置的 ffmpeg
-FFMPEG = (
-    r"C:\Users\xuqin\AppData\Roaming\Python\Python314\site-packages"
-    r"\imageio_ffmpeg\binaries\ffmpeg-win-x86_64-v7.1.exe"
-)
+# 动态获取 ffmpeg 路径
+try:
+    import imageio_ffmpeg
+    FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+except ImportError:
+    FFMPEG = "ffmpeg"
 
 
 class MusicSearcher:
     """从 YouTube 搜索歌曲并截取高潮段"""
 
-    def __init__(self, cache_dir="d:/vedio/assets/music_cache"):
+    def __init__(self, cache_dir=None):
+        if cache_dir is None:
+            cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output", "music_cache")
         self.cache_dir = cache_dir
         os.makedirs(cache_dir, exist_ok=True)
 

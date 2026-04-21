@@ -13,11 +13,14 @@ API 端点:
 import os
 import uuid
 import shutil
+import time
+import threading
+from collections import deque
 from typing import Optional
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from agents.tweet_video_agent import TweetVideoAgent
-from agents.ai_assistant import AIAssistant
+from agents.ai_assistant import get_assistant
 
 app = FastAPI(
     title="NBA Tweet Video Generator API",
@@ -26,17 +29,49 @@ app = FastAPI(
 )
 
 # 上传临时目录
-UPLOAD_DIR = "d:/vedio/output/tweet_videos/uploads"
+UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output", "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 agent = TweetVideoAgent()
-ai = AIAssistant()
+
+# ── 日志收集 ──────────────────────────────────────────────
+_logs: deque = deque(maxlen=500)
+_logs_lock = threading.Lock()
+
+
+def _vlog(msg, level="info"):
+    """记录 video 服务器日志。"""
+    entry = {"time": time.strftime("%H:%M:%S"), "message": str(msg), "level": level}
+    with _logs_lock:
+        _logs.append(entry)
+    print(f"[{entry['time']}] [{level}] {msg}")
+
+
+@app.get("/logs")
+def get_logs(limit: int = 200):
+    """返回最近的日志。"""
+    with _logs_lock:
+        return list(_logs)[-limit:]
 
 
 @app.get("/health")
 def health():
     """健康检查"""
     return {"status": "ok", "service": "tweet-video-generator"}
+
+
+@app.get("/backends")
+def list_backends():
+    """可用的 AI 后端列表"""
+    from agents.ai_assistant import _DEFAULT_BACKEND
+    return {
+        "backends": ["claude", "gpt"],
+        "default": _DEFAULT_BACKEND,
+        "description": {
+            "claude": "Claude Opus 4.6 (本地 CLI，无需 API key)",
+            "gpt": "Azure OpenAI GPT (需要 AZURE_OPENAI_API_KEY)",
+        },
+    }
 
 
 @app.post("/generate")
@@ -47,6 +82,7 @@ async def generate_video(
     original_texts: Optional[str] = Form(None, description="原始英文推文，用 | 分隔"),
     mood: Optional[str] = Form("chill", description="背景音乐氛围: chill/hype/emotional"),
     duration: Optional[float] = Form(12.0, description="视频时长（秒）"),
+    backend: Optional[str] = Form(None, description="AI后端: claude/gpt（默认读 AI_BACKEND 环境变量）"),
 ):
     """
     生成推特短视频（含配音+配乐）
@@ -77,6 +113,8 @@ async def generate_video(
     if not images:
         raise HTTPException(status_code=400, detail="至少需要上传一张截图")
 
+    ai = get_assistant(backend, logger=_vlog)
+    _vlog(f"[generate] 开始生成, 后端={backend or 'default'}, 图片={len(images)}")
     trans_list = [t.strip() for t in translations.split("|")]
     author_list = [a.strip() for a in authors.split("|")] if authors else None
     orig_list = [t.strip() for t in original_texts.split("|")] if original_texts else None
@@ -149,6 +187,7 @@ async def generate_video(
         })
 
     except Exception as e:
+        _vlog(f"视频生成失败: {e}", "error")
         raise HTTPException(status_code=500, detail=f"视频生成失败: {str(e)}")
     finally:
         # 清理上传的临时文件
@@ -163,13 +202,55 @@ async def generate_video(
 @app.get("/video/{filename}")
 def get_video(filename: str):
     """下载/查看已生成的视频"""
-    # 安全检查：防止路径遍历
     if ".." in filename or "/" in filename or "\\" in filename:
         raise HTTPException(status_code=400, detail="非法文件名")
     path = os.path.join(agent.output_dir, filename)
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="视频未找到")
     return FileResponse(path, media_type="video/mp4", filename=filename)
+
+
+@app.get("/videos")
+def list_videos():
+    """列出所有已生成的视频文件。"""
+    videos = []
+    for f in sorted(os.listdir(agent.output_dir), reverse=True):
+        if f.endswith(".mp4") and not f.startswith("tweet_") or f.startswith("tweet_"):
+            fp = os.path.join(agent.output_dir, f)
+            if f.endswith(".mp4") and os.path.isfile(fp):
+                stat = os.stat(fp)
+                videos.append({
+                    "filename": f,
+                    "url": f"/video/{f}",
+                    "size_mb": round(stat.st_size / 1024 / 1024, 2),
+                    "created": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)),
+                })
+    return videos
+
+
+@app.delete("/video/{filename}")
+def delete_video(filename: str):
+    """删除单个视频文件。"""
+    if ".." in filename or "/" in filename or "\\" in filename:
+        raise HTTPException(status_code=400, detail="非法文件名")
+    path = os.path.join(agent.output_dir, filename)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="视频未找到")
+    os.remove(path)
+    _vlog(f"已删除视频: {filename}", "warn")
+    return {"message": f"已删除 {filename}"}
+
+
+@app.delete("/videos")
+def delete_all_videos():
+    """删除所有生成的视频文件。"""
+    count = 0
+    for f in os.listdir(agent.output_dir):
+        if f.endswith(".mp4") and os.path.isfile(os.path.join(agent.output_dir, f)):
+            os.remove(os.path.join(agent.output_dir, f))
+            count += 1
+    _vlog(f"已删除全部 {count} 个视频", "warn")
+    return {"message": f"已删除 {count} 个视频"}
 
 
 @app.post("/generate-ai")
@@ -180,9 +261,13 @@ async def generate_video_ai(
     original_texts: Optional[str] = Form(None, description="原始英文推文，用 | 分隔"),
     duration: Optional[float] = Form(12.0, description="视频时长（秒）"),
     max_rounds: Optional[int] = Form(3, description="最大迭代轮数（1-5）"),
+    backend: Optional[str] = Form(None, description="AI后端: claude/gpt（默认读 AI_BACKEND 环境变量）"),
+    video: Optional[UploadFile] = File(None, description="推文自带视频文件（可选）"),
 ):
     """
-    AI增强版 v3：解说词 + Claude配乐 + 真实歌曲 + 配音 + 迭代审阅
+    AI增强版 v3：解说词 + 配乐 + 真实歌曲 + 配音 + 迭代审阅
+
+    支持 backend 参数选择 AI 后端（claude / gpt）。
 
     流程：
     1. AI 优化翻译（字幕显示用）
@@ -195,6 +280,8 @@ async def generate_video_ai(
     """
     if not images:
         raise HTTPException(status_code=400, detail="至少需要上传一张截图")
+
+    ai = get_assistant(backend, logger=_vlog)
 
     trans_list = [t.strip() for t in translations.split("|")]
     author_list = [a.strip() for a in authors.split("|")] if authors else None
@@ -219,10 +306,21 @@ async def generate_video_ai(
                 f.write(content)
             saved_paths.append(save_path)
 
+        # 保存推文自带视频（如有）
+        saved_video_path = None
+        if video and video.filename:
+            vext = os.path.splitext(video.filename)[1] or ".mp4"
+            video_save = os.path.join(UPLOAD_DIR, f"{request_id}_video{vext}")
+            with open(video_save, "wb") as f:
+                f.write(await video.read())
+            saved_video_path = video_save
+            _vlog(f"[generate-ai] 收到推文视频: {video.filename}")
+
         orig0 = orig_list[0] if orig_list else ""
         author0 = author_list[0] if author_list else ""
 
         # 1. AI 优化翻译（用于字幕显示）
+        _vlog("[generate-ai] 步骤1: 优化翻译")
         polished = []
         for i, trans in enumerate(trans_list):
             orig = orig_list[i] if orig_list and i < len(orig_list) else ""
@@ -232,6 +330,7 @@ async def generate_video_ai(
                 polished.append(trans)
 
         # 2. AI 生成解说词（用于配音，有解说感）
+        _vlog("[generate-ai] 步骤2: 生成解说词")
         commentaries = []
         for i, trans in enumerate(polished):
             orig = orig_list[i] if orig_list and i < len(orig_list) else ""
@@ -243,6 +342,7 @@ async def generate_video_ai(
                 commentaries.append(trans)
 
         # 3. Claude 推荐歌曲 + AI 氛围
+        _vlog("[generate-ai] 步骤3: 推荐配乐")
         song_query = None
         try:
             song_query = ai.recommend_song(orig0, polished[0], author0)
@@ -255,6 +355,7 @@ async def generate_video_ai(
             mood = "chill"
 
         # 4-7. 迭代生成 + 审阅
+        _vlog(f"[generate-ai] 步骤4-7: 开始迭代生成 (最多{max_rounds}轮)")
         best_video = None
         best_review = {"score": 0, "grade": "F"}
         cur_commentary = commentaries[0] if commentaries else polished[0]
@@ -262,6 +363,7 @@ async def generate_video_ai(
         rounds_log = []
 
         for rnd in range(1, max_rounds + 1):
+            _vlog(f"[generate-ai] 第{rnd}轮生成中...")
             output_name = f"tweet_{request_id}_v{rnd}.mp4"
             video_path = agent.generate(
                 images=saved_paths,
@@ -272,6 +374,7 @@ async def generate_video_ai(
                 output_name=output_name,
                 commentary=[cur_commentary],
                 song_query=cur_song,
+                source_video=saved_video_path,
             )
 
             # 审阅
@@ -299,6 +402,7 @@ async def generate_video_ai(
             score = review.get("score", 0)
             grade = review.get("grade", "F")
             suggestions = review.get("suggestions", [])
+            _vlog(f"[generate-ai] 第{rnd}轮评分: {score}分 ({grade}级)")
 
             rounds_log.append({
                 "round": rnd,
@@ -315,6 +419,7 @@ async def generate_video_ai(
 
             # A级合格，停止迭代
             if score >= 90:
+                _vlog(f"[generate-ai] A级达标，停止迭代", "success")
                 break
 
             # 未达标，改进内容
@@ -352,6 +457,7 @@ async def generate_video_ai(
         final_path = os.path.join(agent.output_dir, final_name)
         if best_video and best_video != final_path:
             shutil.copy2(best_video, final_path)
+        _vlog(f"[generate-ai] 完成! 最终评分: {best_review.get('score',0)}分 ({best_review.get('grade','?')}级)", "success")
 
         return JSONResponse(content={
             "video_url": f"/video/{final_name}",
@@ -372,6 +478,7 @@ async def generate_video_ai(
         })
 
     except Exception as e:
+        _vlog(f"视频生成失败: {e}", "error")
         raise HTTPException(status_code=500, detail=f"视频生成失败: {str(e)}")
     finally:
         for p in saved_paths:
@@ -380,8 +487,10 @@ async def generate_video_ai(
                     os.remove(p)
                 except Exception:
                     pass
-
-
-if __name__ == "__main__":
+        if saved_video_path and os.path.exists(saved_video_path):
+            try:
+                os.remove(saved_video_path)
+            except Exception:
+                pass
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

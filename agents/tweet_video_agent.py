@@ -105,7 +105,9 @@ class TweetVideoAgent:
     输出：视频文件路径
     """
 
-    def __init__(self, output_dir="d:/vedio/output/tweet_videos"):
+    def __init__(self, output_dir=None):
+        if output_dir is None:
+            output_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
         self.output_dir = output_dir
         self.audio_dir = os.path.join(output_dir, "audio")
         os.makedirs(self.output_dir, exist_ok=True)
@@ -237,9 +239,40 @@ class TweetVideoAgent:
 
         return img
 
+    def _create_video_clip(self, video_path, target_duration=None):
+        """将推文自带视频适配为 9:16 竖屏"""
+        from moviepy import VideoFileClip
+        clip = VideoFileClip(video_path)
+
+        w, h = clip.size
+        target_ratio = WIDTH / HEIGHT  # 0.5625
+
+        current_ratio = w / h
+        if current_ratio > target_ratio:
+            # 横屏：裁剪左右
+            new_w = int(h * target_ratio)
+            x_center = w // 2
+            clip = clip.cropped(x1=x_center - new_w // 2, x2=x_center + new_w // 2)
+        elif current_ratio < target_ratio:
+            # 竖屏偏窄或方形：裁剪上下
+            new_h = int(w / target_ratio)
+            y_center = h // 2
+            clip = clip.cropped(y1=max(0, y_center - new_h // 2),
+                                y2=min(h, y_center + new_h // 2))
+
+        clip = clip.resized((WIDTH, HEIGHT))
+
+        if target_duration:
+            if clip.duration < target_duration:
+                clip = clip.with_effects([vfx.Loop(duration=target_duration)])
+            else:
+                clip = clip.with_duration(target_duration)
+
+        return clip
+
     def generate(self, images, translations, authors=None, mood="chill",
                  duration=12.0, output_name=None, commentary=None,
-                 song_query=None):
+                 song_query=None, source_video=None):
         """
         生成推特短视频（逐句字幕版）
         
@@ -309,13 +342,18 @@ class TweetVideoAgent:
                 output_name=bgm_name,
             )
 
-        # 3. 生成背景帧（截图居中，无翻译文字）
-        frame = self._create_frame(images[0], "", authors[0] if authors else "")
-        frame_path = os.path.join(self.output_dir, "frame_0.png")
-        frame.save(frame_path, quality=95)
-
-        bg_clip = ImageClip(frame_path).with_duration(actual_duration)
-        bg_clip = bg_clip.with_effects([vfx.FadeIn(0.5), vfx.FadeOut(0.5)])
+        # 3. 生成背景（有推文视频时用视频，否则用截图静态帧）
+        frame_path = None
+        if source_video and os.path.exists(source_video):
+            print(f"  [Video] 使用推文自带视频: {source_video}")
+            bg_clip = self._create_video_clip(source_video, target_duration=actual_duration)
+            bg_clip = bg_clip.with_effects([vfx.FadeIn(0.5), vfx.FadeOut(0.5)])
+        else:
+            frame = self._create_frame(images[0], "", authors[0] if authors else "")
+            frame_path = os.path.join(self.output_dir, "frame_0.png")
+            frame.save(frame_path, quality=95)
+            bg_clip = ImageClip(frame_path).with_duration(actual_duration)
+            bg_clip = bg_clip.with_effects([vfx.FadeIn(0.5), vfx.FadeOut(0.5)])
 
         # 4. 构建逐句字幕（读一句展示一句）
         subtitle_clips = []
@@ -383,7 +421,7 @@ class TweetVideoAgent:
         )
 
         # 清理临时文件
-        if os.path.exists(frame_path):
+        if frame_path and os.path.exists(frame_path):
             try:
                 os.remove(frame_path)
             except Exception:
