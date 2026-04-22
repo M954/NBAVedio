@@ -13,8 +13,21 @@ class VoiceActor:
     def __init__(self, output_dir, voice="zh-CN-YunyangNeural"):
         self.output_dir = output_dir
         self.voice = voice
+        self._resolved_voice = None
         self._loop = None
         os.makedirs(output_dir, exist_ok=True)
+
+    def _get_voice_candidates(self):
+        """返回按优先级排序的可选 voice，去重后用于首次锁定音色。"""
+        candidates = [self.voice, "zh-CN-YunjianNeural", "zh-CN-YunxiNeural"]
+        ordered = []
+        seen = set()
+        for voice in candidates:
+            if voice in seen:
+                continue
+            seen.add(voice)
+            ordered.append(voice)
+        return ordered
 
     def _get_loop(self):
         """获取或创建一个可复用的事件循环，避免反复 asyncio.run() 导致冲突"""
@@ -44,19 +57,24 @@ class VoiceActor:
         return text
 
     async def _synthesize(self, text, output_path, rate="+0%", volume="+0%", pitch="+0Hz"):
-        # 尝试主声音，失败时回退到备用声音
-        voices = [self.voice, "zh-CN-YunjianNeural", "zh-CN-YunxiNeural"]
+        # 首次成功后锁定 voice，保证整条视频音色一致
+        voices = [self._resolved_voice] if self._resolved_voice else self._get_voice_candidates()
+        last_error = None
         for voice in voices:
             try:
                 communicate = edge_tts.Communicate(
                     text, voice, rate=rate, volume=volume, pitch=pitch
                 )
                 await communicate.save(output_path)
-                return  # 成功就返回
-            except Exception:
+                self._resolved_voice = voice
+                return voice
+            except Exception as exc:
+                last_error = exc
+                if self._resolved_voice:
+                    break
                 continue
         # 全部失败，抛出异常
-        raise RuntimeError("所有语音均合成失败")
+        raise RuntimeError(f"所有语音均合成失败: {last_error}")
 
     def _validate_mp3(self, path):
         """验证 MP3 文件是否有效"""

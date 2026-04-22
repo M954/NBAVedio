@@ -497,20 +497,32 @@ def _do_generate_ai_inner(saved_paths, saved_video_path, trans_list, author_list
         except Exception:
             polished.append(trans)
 
-    # 2. AI 生成解说词（用于配音，有解说感）
-    _vlog("[generate-ai] 步骤2: 生成解说词")
+    # 2. 如果有推文视频，先分析视频内容
+    video_description = ""
+    if saved_video_path:
+        _vlog("[generate-ai] 步骤2: 分析推文视频内容")
+        try:
+            video_description = ai.analyze_video_content(saved_video_path, orig0, author0)
+            _vlog(f"[generate-ai] 视频内容: {video_description}")
+        except Exception as e:
+            _vlog(f"[generate-ai] 视频分析失败: {e}", "warn")
+
+    # 3. AI 生成解说词（用于配音，有解说感）
+    _vlog("[generate-ai] 步骤3: 生成解说词")
     commentaries = []
     for i, trans in enumerate(polished):
         orig = orig_list[i] if orig_list and i < len(orig_list) else ""
         author = author_list[i] if author_list and i < len(author_list) else ""
         try:
-            c = ai.generate_commentary(orig, trans, author)
+            c = ai.generate_commentary(orig, trans, author,
+                                       has_video=saved_video_path is not None,
+                                       video_description=video_description)
             commentaries.append(c)
         except Exception:
             commentaries.append(trans)
 
-    # 3. Claude 推荐歌曲 + AI 氛围
-    _vlog("[generate-ai] 步骤3: 推荐配乐")
+    # 4. Claude 推荐歌曲 + AI 氛围
+    _vlog("[generate-ai] 步骤4: 推荐配乐")
     song_query = None
     try:
         song_query = ai.recommend_song(orig0, polished[0], author0)
@@ -522,10 +534,11 @@ def _do_generate_ai_inner(saved_paths, saved_video_path, trans_list, author_list
     except Exception:
         mood = "chill"
 
-    # 4-7. 迭代生成 + 审阅
-    _vlog(f"[generate-ai] 步骤4-7: 开始迭代生成 (最多{max_rounds}轮)")
+    # 5-8. 迭代生成 + 审阅
+    _vlog(f"[generate-ai] 步骤5-8: 开始迭代生成 (最多{max_rounds}轮)")
     best_video = None
     best_review = {"score": 0, "grade": "F"}
+    best_round = None
     cur_commentary = commentaries[0] if commentaries else polished[0]
     cur_song = song_query
     rounds_log = []
@@ -585,6 +598,11 @@ def _do_generate_ai_inner(saved_paths, saved_video_path, trans_list, author_list
         if score > best_review.get("score", 0):
             best_video = video_path
             best_review = review
+            best_round = {
+                "round": rnd,
+                "commentary": cur_commentary,
+                "song": cur_song,
+            }
 
         if score >= 90:
             _vlog("[generate-ai] A级达标，停止迭代", "success")
@@ -593,14 +611,18 @@ def _do_generate_ai_inner(saved_paths, saved_video_path, trans_list, author_list
         if rnd < max_rounds:
             try:
                 improved = ai._call(
+                    f"你是篮球邮差Melo风格的NBA短视频博主。请根据审阅建议重写解说词。\n\n"
                     f"当前解说词: {cur_commentary}\n"
                     f"审阅建议: {'; '.join(suggestions)}\n"
-                    f"原始推文: {orig0}\n作者: {author0}\n"
-                    f"请根据建议重写解说词：\n"
-                    f"1. 必须解读推文行为（转发/引用/回复/原创）\n"
-                    f"2. 必须说明态度（支持/反对/调侃/感慨）\n"
-                    f"3. 必须补充背景信息\n"
-                    f"50-80字。只返回解说词。"
+                    f"原始推文: {orig0}\n作者: {author0}\n\n"
+                    f"重写要求：\n"
+                    f"1. 用球星昵称+情绪钩子开头\n"
+                    f"2. 中间引述事件细节，用'他表示''说道'做过渡\n"
+                    f"3. 结尾加个人观点/反问/情绪判断\n"
+                    f"4. 事实占45%，评论占55%\n"
+                    f"5. 使用口语词：真的、太、算是、天啊、好家伙、没得说\n"
+                    f"6. 禁用：公开表态、隔空致意、展现了、彰显了、认可与致敬\n"
+                    f"80-150字。只返回解说词。"
                 )
                 if improved and len(improved.strip()) > 10:
                     cur_commentary = improved.strip().strip('"').strip("'")
@@ -622,6 +644,10 @@ def _do_generate_ai_inner(saved_paths, saved_video_path, trans_list, author_list
     final_path = os.path.join(agent.output_dir, final_name)
     if best_video and best_video != final_path:
         shutil.copy2(best_video, final_path)
+    final_commentary = best_round["commentary"] if best_round else cur_commentary
+    final_song = best_round["song"] if best_round else cur_song
+    final_round = best_round["round"] if best_round else max_rounds
+    _vlog(f"[generate-ai] 采用第{final_round}轮作为最终成片")
     _vlog(f"[generate-ai] 完成! 最终评分: {best_review.get('score',0)}分 ({best_review.get('grade','?')}级)", "success")
 
     return {
@@ -633,10 +659,11 @@ def _do_generate_ai_inner(saved_paths, saved_video_path, trans_list, author_list
         "ai_enhanced": {
             "original_translation": trans_list[0] if trans_list else "",
             "polished_translation": polished[0] if polished else "",
-            "final_commentary": cur_commentary,
-            "recommended_song": cur_song,
+            "final_commentary": final_commentary,
+            "recommended_song": final_song,
             "recommended_mood": mood,
             "final_review": best_review,
+            "selected_round": final_round,
             "total_rounds": len(rounds_log),
             "rounds": rounds_log,
         },

@@ -149,13 +149,13 @@ class TweetVideoAgent:
         except Exception as e:
             raise ValueError(f"无法加载截图: {screenshot_path}: {e}")
 
-        # 截图适配竖屏：宽度占屏幕 90%，高度自适应
-        target_w = int(WIDTH * 0.90)
+        # 截图适配竖屏：宽度占屏幕 95%，高度自适应
+        target_w = int(WIDTH * 0.95)
         tw, th = tweet_img.size
         scale = target_w / tw
         target_h = int(th * scale)
-        # 放宽最大高度限制（不再需要翻译区域）
-        max_h = int(HEIGHT * 0.70)
+        # 放宽最大高度限制
+        max_h = int(HEIGHT * 0.80)
         if target_h > max_h:
             scale = max_h / th
             target_w = int(tw * scale)
@@ -180,49 +180,75 @@ class TweetVideoAgent:
         return bg
 
     @staticmethod
+    def _chunk_subtitle_text(text, max_len=20):
+        """把缺少标点的长句切成更适合逐句字幕的短片段。"""
+        text = text.strip()
+        if not text:
+            return []
+
+        tokens = re.findall(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)*|[\u4e00-\u9fff]|[^\s]", text)
+        if not tokens:
+            return [text]
+
+        chunks = []
+        buf = ""
+        for token in tokens:
+            if not buf:
+                candidate = token
+            elif re.match(r"[A-Za-z0-9]", token) and re.search(r"[A-Za-z0-9]$", buf):
+                candidate = f"{buf} {token}"
+            else:
+                candidate = buf + token
+
+            if len(candidate) > max_len and buf:
+                chunks.append(buf)
+                buf = token
+            else:
+                buf = candidate
+
+        if buf:
+            chunks.append(buf)
+        return chunks
+
+    @staticmethod
     def _split_sentences(text):
         """将解说词拆分为短句，用于逐句展示字幕"""
         clean = _strip_emoji(text).strip()
         if not clean:
             return []
-        # 按中文句号、逗号等拆分，保留有意义的片段
-        parts = re.split(r'[。！？；\n]+', clean)
+        # 先按强停顿切句，再把缺少标点的长句继续切块
+        parts = re.split(r'[。！？!?；;\n]+', clean)
         sentences = []
         for p in parts:
             p = p.strip()
             if not p:
                 continue
-            # 如果句子太长（>20字），再按逗号拆
-            if len(p) > 20:
-                sub = re.split(r'[，、]+', p)
-                buf = ""
-                for s in sub:
-                    s = s.strip()
-                    if not s:
-                        continue
-                    if buf and len(buf) + len(s) > 20:
-                        sentences.append(buf)
-                        buf = s
-                    else:
-                        buf = buf + "，" + s if buf else s
-                if buf:
-                    sentences.append(buf)
-            else:
-                sentences.append(p)
+            sub_parts = [s.strip() for s in re.split(r'[，、,:：]+', p) if s.strip()]
+            if not sub_parts:
+                continue
+            for part in sub_parts:
+                if len(part) > 20:
+                    sentences.extend(TweetVideoAgent._chunk_subtitle_text(part, max_len=20))
+                else:
+                    sentences.append(part)
         return sentences
 
     def _render_subtitle_frame(self, text, width=WIDTH, height=160):
         """渲染一帧透明背景的字幕图片（RGBA）"""
-        img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
         font = _get_font(40, bold=True)
+        line_height = 56
+        vertical_padding = 12
 
         # 计算文字宽度居中
         lines = _wrap_text(text, font, width - 120)
-        total_h = len(lines) * 56
-        y = (height - total_h) // 2
+        total_h = len(lines) * line_height
+        frame_height = max(height, total_h + vertical_padding * 2)
 
-        for line in lines[:3]:
+        img = Image.new("RGBA", (width, frame_height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        y = max((frame_height - total_h) // 2, vertical_padding)
+
+        for line in lines:
             bbox = font.getbbox(line)
             tw = bbox[2] - bbox[0]
             x = (width - tw) // 2
@@ -235,7 +261,7 @@ class TweetVideoAgent:
                     draw.text((x + dx, y + dy), line, font=font, fill=(0, 0, 0, 180))
             # 白色主文字
             draw.text((x, y), line, font=font, fill=(255, 255, 255, 255))
-            y += 56
+            y += line_height
 
         return img
 
@@ -344,7 +370,7 @@ class TweetVideoAgent:
 
         # 3. 生成背景
         frame_path = None
-        INTRO_DUR = 2.5  # 截图开场时长
+        INTRO_DUR = 5.0  # 截图开场时长（多停留让观众看清推文）
         if source_video and os.path.exists(source_video):
             print(f"  [Video] 使用推文自带视频: {source_video}")
             # 截图开场 → 淡入推文视频
@@ -380,8 +406,7 @@ class TweetVideoAgent:
 
         # 4. 构建逐句字幕（读一句展示一句）
         subtitle_clips = []
-        # 字幕位置：屏幕偏下
-        sub_y = HEIGHT - 280
+        sub_bottom_margin = 120
 
         offset = 1.0  # 配音延迟1秒
         tts_parts = []
@@ -391,6 +416,7 @@ class TweetVideoAgent:
             sub_img = self._render_subtitle_frame(sent_text)
             sub_path = os.path.join(self.output_dir, f"sub_{uuid.uuid4().hex[:6]}.png")
             sub_img.save(sub_path)
+            sub_y = HEIGHT - sub_img.size[1] - sub_bottom_margin
 
             # 字幕 clip：与该句配音同步，多留0.3秒展示
             sub_clip = (
