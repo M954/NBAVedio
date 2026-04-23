@@ -6,34 +6,48 @@ import time
 import wave
 import edge_tts
 
+# Edge TTS 需要通过代理访问 speech.platform.bing.com
+# 自动从系统代理设置中读取，设置到环境变量供 aiohttp 使用
+if not os.environ.get("HTTPS_PROXY") and not os.environ.get("https_proxy"):
+    try:
+        import urllib.request as _ur
+        _sys_proxies = _ur.getproxies()
+        if "https" in _sys_proxies:
+            os.environ["HTTPS_PROXY"] = _sys_proxies["https"]
+            os.environ["https_proxy"] = _sys_proxies["https"]
+    except Exception:
+        pass
+
 
 class VoiceActor:
     """使用 edge-tts 将文本转为语音"""
 
-    def __init__(self, output_dir, voice="zh-CN-YunyangNeural"):
+    def __init__(self, output_dir, voice="zh-CN-YunxiNeural"):
         self.output_dir = output_dir
         self.voice = voice
         self._resolved_voice = None
         self._loop = None
+        self._proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or None
         os.makedirs(output_dir, exist_ok=True)
 
     def _get_voice_candidates(self):
-        """返回按优先级排序的可选 voice，去重后用于首次锁定音色。"""
-        candidates = [self.voice, "zh-CN-YunjianNeural", "zh-CN-YunxiNeural"]
-        ordered = []
-        seen = set()
-        for voice in candidates:
-            if voice in seen:
-                continue
-            seen.add(voice)
-            ordered.append(voice)
-        return ordered
+        """返回可选 voice，固定使用 YunxiNeural（最接近参考视频风格）。"""
+        return [self.voice]
 
     def _get_loop(self):
         """获取或创建一个可复用的事件循环，避免反复 asyncio.run() 导致冲突"""
         if self._loop is None or self._loop.is_closed():
             self._loop = asyncio.new_event_loop()
+            # Windows 上 ProactorEventLoop 关闭连接时会触发无害的 ConnectionResetError
+            self._loop.set_exception_handler(self._suppress_connection_reset)
         return self._loop
+
+    @staticmethod
+    def _suppress_connection_reset(loop, context):
+        exc = context.get("exception")
+        if isinstance(exc, (ConnectionResetError, OSError)):
+            return  # 静默忽略 TTS 连接关闭时的无害错误
+        loop.default_exception_handler(context)
 
     def _run_async(self, coro):
         """在事件循环中执行协程"""
@@ -63,7 +77,8 @@ class VoiceActor:
         for voice in voices:
             try:
                 communicate = edge_tts.Communicate(
-                    text, voice, rate=rate, volume=volume, pitch=pitch
+                    text, voice, rate=rate, volume=volume, pitch=pitch,
+                    proxy=self._proxy,
                 )
                 await communicate.save(output_path)
                 self._resolved_voice = voice

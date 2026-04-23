@@ -17,6 +17,8 @@ import time
 import threading
 from collections import deque
 from typing import Optional
+from dotenv import load_dotenv
+load_dotenv()
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from agents.tweet_video_agent import TweetVideoAgent
@@ -33,6 +35,11 @@ UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output", 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 agent = TweetVideoAgent()
+
+# ── 取消机制 ──────────────────────────────────────────────
+_cancel_flags: dict[str, bool] = {}  # request_id -> cancelled
+_active_request_id: str = ""  # 当前正在生成的 request_id
+_last_request_id: str = ""   # 上一次生成的 request_id（下次生成时清理其中间产物）
 
 # ── 日志收集 ──────────────────────────────────────────────
 _logs: deque = deque(maxlen=500)
@@ -117,6 +124,26 @@ def get_logs(limit: int = 200):
     """返回最近的日志。"""
     with _logs_lock:
         return list(_logs)[-limit:]
+
+
+@app.post("/cancel")
+def cancel_generation():
+    """取消当前正在进行的视频生成。"""
+    global _active_request_id
+    if _active_request_id:
+        _cancel_flags[_active_request_id] = True
+        _vlog(f"[cancel] 收到取消请求，正在停止 {_active_request_id}...", "warn")
+        return {"status": "cancelling", "request_id": _active_request_id}
+    return {"status": "no_active_task"}
+
+
+@app.get("/status")
+def get_status():
+    """返回当前生成状态。"""
+    return {
+        "active_request_id": _active_request_id,
+        "is_generating": bool(_active_request_id and _active_request_id not in _cancel_flags),
+    }
 
 
 def _cleanup_intermediates(request_id, output_dir, audio_dir):
@@ -373,7 +400,7 @@ async def generate_video_ai(
     authors: Optional[str] = Form(None, description="作者列表，用 | 分隔"),
     original_texts: Optional[str] = Form(None, description="原始英文推文，用 | 分隔"),
     duration: Optional[float] = Form(12.0, description="视频时长（秒）"),
-    max_rounds: Optional[int] = Form(3, description="最大迭代轮数（1-5）"),
+    max_rounds: Optional[int] = Form(3, description="最大迭代轮数（1-3）"),
     backend: Optional[str] = Form(None, description="AI后端: claude/gpt（默认读 AI_BACKEND 环境变量）"),
     video: Optional[UploadFile] = File(None, description="推文自带视频文件（可选）"),
 ):
@@ -402,7 +429,7 @@ async def generate_video_ai(
 
     if duration < 5 or duration > 60:
         duration = 12.0
-    if max_rounds < 1 or max_rounds > 5:
+    if max_rounds < 1 or max_rounds > 3:
         max_rounds = 3
 
     saved_paths = []
@@ -443,41 +470,28 @@ async def generate_video_ai(
     except Exception as e:
         _vlog(f"视频生成失败: {e}", "error")
         raise HTTPException(status_code=500, detail=f"视频生成失败: {str(e)}")
-    finally:
-        _cleanup_intermediates(request_id, agent.output_dir, agent.audio_dir)
-        for p in saved_paths:
-            if os.path.exists(p):
-                try:
-                    os.remove(p)
-                except Exception:
-                    pass
-        if saved_video_path and os.path.exists(saved_video_path):
-            try:
-                os.remove(saved_video_path)
-            except Exception:
-                pass
 
 
 def _do_generate_ai(saved_paths, saved_video_path, trans_list, author_list, orig_list,
                     duration, max_rounds, ai, request_id):
     """同步执行视频生成全流程（在线程池中运行）。"""
+    global _active_request_id
+    global _active_request_id, _last_request_id
+    _active_request_id = request_id
+
+    # 清理上一次生成的中间产物（当前轮保留用于分析）
+    if _last_request_id:
+        _vlog(f"[cleanup] 清理上一轮 ({_last_request_id}) 的中间产物")
+        _cleanup_intermediates(_last_request_id, agent.output_dir, agent.audio_dir)
+
     result = None
     try:
         result = _do_generate_ai_inner(saved_paths, saved_video_path, trans_list,
                                         author_list, orig_list, duration, max_rounds, ai, request_id)
     finally:
-        _cleanup_intermediates(request_id, agent.output_dir, agent.audio_dir)
-        for p in saved_paths:
-            if os.path.exists(p):
-                try:
-                    os.remove(p)
-                except Exception:
-                    pass
-        if saved_video_path and os.path.exists(saved_video_path):
-            try:
-                os.remove(saved_video_path)
-            except Exception:
-                pass
+        _active_request_id = ""
+        _cancel_flags.pop(request_id, None)
+        _last_request_id = request_id  # 记录当前 request_id，下次生成时清理
     return result
 
 
@@ -485,29 +499,60 @@ def _do_generate_ai_inner(saved_paths, saved_video_path, trans_list, author_list
                           duration, max_rounds, ai, request_id):
     orig0 = orig_list[0] if orig_list else ""
     author0 = author_list[0] if author_list else ""
+    import time as _t
+    _pipeline_start = _t.time()
 
     # 1. AI 优化翻译（用于字幕显示）
     _reset_log()
+    _step_t = _t.time()
     _vlog("[generate-ai] 步骤1: 优化翻译")
     polished = []
     for i, trans in enumerate(trans_list):
         orig = orig_list[i] if orig_list and i < len(orig_list) else ""
         try:
-            polished.append(ai.polish_translation(orig, trans))
-        except Exception:
+            result = ai.polish_translation(orig, trans)
+            polished.append(result)
+            _vlog(f"  翻译优化: {trans[:30]}... → {result[:30]}...")
+        except Exception as e:
             polished.append(trans)
+            _vlog(f"  翻译优化失败: {e}", "warn")
+    _vlog(f"[generate-ai] 步骤1完成，耗时 {_t.time()-_step_t:.1f}s")
 
     # 2. 如果有推文视频，先分析视频内容
     video_description = ""
+    video_subtitles = []
     if saved_video_path:
+        _step_t = _t.time()
         _vlog("[generate-ai] 步骤2: 分析推文视频内容")
         try:
             video_description = ai.analyze_video_content(saved_video_path, orig0, author0)
-            _vlog(f"[generate-ai] 视频内容: {video_description}")
+            _vlog(f"[generate-ai] 视频内容: {video_description[:100]}...")
         except Exception as e:
             _vlog(f"[generate-ai] 视频分析失败: {e}", "warn")
+        # 提取视频中的对话/旁白翻译为字幕
+        if video_description:
+            try:
+                video_subtitles = ai.extract_video_dialogue(video_description, orig0, author0)
+                if video_subtitles:
+                    _vlog(f"[generate-ai] 提取视频字幕: {video_subtitles}")
+            except Exception as e:
+                _vlog(f"[generate-ai] 提取视频字幕失败: {e}", "warn")
+        _vlog(f"[generate-ai] 步骤2完成，耗时 {_t.time()-_step_t:.1f}s")
+
+    # 计算目标视频时长（用于生成匹配长度的解说词）
+    target_video_duration = duration
+    if saved_video_path:
+        try:
+            from moviepy import VideoFileClip as _VFC
+            _vc = _VFC(saved_video_path)
+            target_video_duration = max(duration, _vc.duration + 5.0)  # 源视频 + 5s 开场
+            _vc.close()
+            _vlog(f"[generate-ai] 目标视频时长: {target_video_duration:.1f}s (源视频 {target_video_duration-5:.1f}s + 5s开场)")
+        except Exception:
+            pass
 
     # 3. AI 生成解说词（用于配音，有解说感）
+    _step_t = _t.time()
     _vlog("[generate-ai] 步骤3: 生成解说词")
     commentaries = []
     for i, trans in enumerate(polished):
@@ -516,23 +561,31 @@ def _do_generate_ai_inner(saved_paths, saved_video_path, trans_list, author_list
         try:
             c = ai.generate_commentary(orig, trans, author,
                                        has_video=saved_video_path is not None,
-                                       video_description=video_description)
+                                       video_description=video_description,
+                                       target_duration=target_video_duration)
             commentaries.append(c)
-        except Exception:
+            _vlog(f"  解说词: {c[:80]}...")
+        except Exception as e:
             commentaries.append(trans)
+            _vlog(f"  解说词生成失败: {e}", "warn")
+    _vlog(f"[generate-ai] 步骤3完成，耗时 {_t.time()-_step_t:.1f}s")
 
     # 4. Claude 推荐歌曲 + AI 氛围
+    _step_t = _t.time()
     _vlog("[generate-ai] 步骤4: 推荐配乐")
     song_query = None
     try:
         song_query = ai.recommend_song(orig0, polished[0], author0)
+        _vlog(f"  推荐歌曲: {song_query}")
     except Exception:
         pass
 
     try:
         mood = ai.recommend_mood(orig0, polished[0])
+        _vlog(f"  配乐氛围: {mood}")
     except Exception:
         mood = "chill"
+    _vlog(f"[generate-ai] 步骤4完成，耗时 {_t.time()-_step_t:.1f}s")
 
     # 5-8. 迭代生成 + 审阅
     _vlog(f"[generate-ai] 步骤5-8: 开始迭代生成 (最多{max_rounds}轮)")
@@ -544,8 +597,14 @@ def _do_generate_ai_inner(saved_paths, saved_video_path, trans_list, author_list
     rounds_log = []
 
     for rnd in range(1, max_rounds + 1):
+        # 检查取消标志
+        if _cancel_flags.get(request_id):
+            _vlog("[generate-ai] 收到取消请求，停止生成", "warn")
+            break
+        _rnd_t = _t.time()
         _vlog(f"[generate-ai] 第{rnd}轮生成中...")
         output_name = f"tweet_{request_id}_v{rnd}.mp4"
+        _gen_t = _t.time()
         video_path = agent.generate(
             images=saved_paths,
             translations=polished,
@@ -556,16 +615,27 @@ def _do_generate_ai_inner(saved_paths, saved_video_path, trans_list, author_list
             commentary=[cur_commentary],
             song_query=cur_song,
             source_video=saved_video_path,
+            video_subtitles=video_subtitles,
         )
+        _vlog(f"  视频生成耗时: {_t.time()-_gen_t:.1f}s")
+
+        # 检查取消标志
+        if _cancel_flags.get(request_id):
+            _vlog("[generate-ai] 收到取消请求，跳过审阅", "warn")
+            best_video = video_path
+            break
 
         # 审阅
+        _rev_t = _t.time()
         from moviepy import VideoFileClip
         clip = VideoFileClip(video_path)
         info = {
             "commentary": cur_commentary,
             "translation": polished[0] if polished else "",
+            "original_text": orig0,
             "author": author0,
-            "bgm_song": cur_song or "合成音乐",
+            "video_description": video_description,
+            "bgm_song": cur_song or "BGM库",
             "mood": mood,
             "has_narration": True,
             "has_source_video": saved_video_path is not None,
@@ -577,14 +647,27 @@ def _do_generate_ai_inner(saved_paths, saved_video_path, trans_list, author_list
         clip.close()
 
         try:
-            review = ai.review_video(info, video_path=video_path)
+            review = ai.review_video(info, video_path=video_path,
+                                     subtitle_timeline=agent.last_subtitle_timeline)
         except Exception as e:
             review = {"score": 70, "grade": "C", "suggestions": [str(e)]}
+        _vlog(f"  审阅耗时: {_t.time()-_rev_t:.1f}s")
 
         score = review.get("score", 0)
         grade = review.get("grade", "F")
         suggestions = review.get("suggestions", [])
+        details = review.get("details", {})
+        content_issues = review.get("content_issues", [])
+        subtitle_mismatches = review.get("subtitle_mismatches", [])
         _vlog(f"[generate-ai] 第{rnd}轮评分: {score}分 ({grade}级)")
+        if details:
+            _vlog(f"  评分明细: {details}")
+        if content_issues:
+            _vlog(f"  内容问题: {content_issues}", "warn")
+        if subtitle_mismatches:
+            _vlog(f"  字幕不匹配: {subtitle_mismatches}", "warn")
+        if suggestions:
+            _vlog(f"  改进建议: {suggestions}")
 
         rounds_log.append({
             "round": rnd,
@@ -606,35 +689,51 @@ def _do_generate_ai_inner(saved_paths, saved_video_path, trans_list, author_list
 
         if score >= 90:
             _vlog("[generate-ai] A级达标，停止迭代", "success")
+            _vlog(f"  第{rnd}轮总耗时: {_t.time()-_rnd_t:.1f}s")
             break
 
         if rnd < max_rounds:
+            _vlog(f"[generate-ai] 第{rnd}轮未达标 (耗时 {_t.time()-_rnd_t:.1f}s)，准备改进...")
+            # 把 review 建议传给解说词重写
+            suggestion_hint = "；".join(suggestions) if suggestions else ""
             try:
-                improved = ai._call(
-                    f"你是篮球邮差Melo风格的NBA短视频博主。请根据审阅建议重写解说词。\n\n"
+                rewrite_prompt = (
+                    f"请根据以下审阅反馈重写解说词。\n\n"
                     f"当前解说词: {cur_commentary}\n"
-                    f"审阅建议: {'; '.join(suggestions)}\n"
-                    f"原始推文: {orig0}\n作者: {author0}\n\n"
-                    f"重写要求：\n"
-                    f"1. 用球星昵称+情绪钩子开头\n"
-                    f"2. 中间引述事件细节，用'他表示''说道'做过渡\n"
-                    f"3. 结尾加个人观点/反问/情绪判断\n"
-                    f"4. 事实占45%，评论占55%\n"
-                    f"5. 使用口语词：真的、太、算是、天啊、好家伙、没得说\n"
-                    f"6. 禁用：公开表态、隔空致意、展现了、彰显了、认可与致敬\n"
-                    f"80-150字。只返回解说词。"
+                    f"审阅建议: {suggestion_hint}\n\n"
+                    f"推文原文: {orig0}\n"
+                    f"翻译: {polished[0] if polished else ''}\n"
+                    f"作者: {author0}\n"
                 )
+                if video_description:
+                    rewrite_prompt += f"视频内容: {video_description}\n"
+                rewrite_prompt += (
+                    f"\n重写要求：\n"
+                    f"1. 必须忠实于推文原文的事实，不能添油加醋或编造细节\n"
+                    f"2. 如果有视频，解说词必须与视频内容一致\n"
+                    f"3. 针对审阅建议中指出的问题进行修正\n"
+                    f"4. 保持篮球邮差Melo的口语风格\n"
+                    f"80-150字，只返回解说词。"
+                )
+                improved = ai._call(rewrite_prompt)
                 if improved and len(improved.strip()) > 10:
                     cur_commentary = improved.strip().strip('"').strip("'")
-            except Exception:
-                pass
+                    _vlog(f"  解说词已重写: {cur_commentary[:50]}...")
+            except Exception as e:
+                _vlog(f"  解说词重写失败: {e}", "warn")
 
             for s in suggestions:
                 if "配乐" in s or "歌曲" in s or "音乐" in s or "BGM" in s or "合成" in s:
                     try:
-                        new_song = ai.recommend_song(orig0, polished[0], author0)
-                        if new_song and new_song != cur_song:
-                            cur_song = new_song
+                        _bgm_dir = os.path.join(os.path.dirname(__file__), "reference_videos", "bgm")
+                        new_bgm = ai.select_bgm_from_library(
+                            orig0, polished[0] if polished else "", author0, _bgm_dir)
+                        if new_bgm:
+                            cur_song = None  # 走 BGM 库，不走搜索下载
+                        else:
+                            new_song = ai.recommend_song(orig0, polished[0], author0)
+                            if new_song and new_song != cur_song:
+                                cur_song = new_song
                     except Exception:
                         pass
                     break
@@ -648,7 +747,8 @@ def _do_generate_ai_inner(saved_paths, saved_video_path, trans_list, author_list
     final_song = best_round["song"] if best_round else cur_song
     final_round = best_round["round"] if best_round else max_rounds
     _vlog(f"[generate-ai] 采用第{final_round}轮作为最终成片")
-    _vlog(f"[generate-ai] 完成! 最终评分: {best_review.get('score',0)}分 ({best_review.get('grade','?')}级)", "success")
+    _total = _t.time() - _pipeline_start
+    _vlog(f"[generate-ai] 完成! 最终评分: {best_review.get('score',0)}分 ({best_review.get('grade','?')}级), 总耗时: {_total:.1f}s ({_total/60:.1f}min)", "success")
 
     return {
         "video_url": f"/video/{final_name}",

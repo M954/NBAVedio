@@ -5,6 +5,7 @@
   - 环境变量 AI_BACKEND=claude 或 AI_BACKEND=gpt（默认 claude）
   - API 调用时可通过 backend 参数覆盖
 """
+import base64
 import json
 import os
 import re
@@ -27,142 +28,200 @@ class _BaseAssistant:
     def _call(self, prompt, system="你是一个专业的NBA篮球内容编辑和翻译。"):
         raise NotImplementedError
 
-    @staticmethod
-    def _frame_visual_metrics(img):
-        """提取一帧的基础视觉线索，尽量减少只靠推文文案猜内容。"""
-        import numpy as np
+    # ── Gemini 视频直传分析 ──────────────────────────────────
 
-        hsv = np.array(img.convert("HSV"))
-        ycbcr = np.array(img.convert("YCbCr"))
-        gray = np.array(img.convert("L"), dtype=np.int16)
-
-        hue = hsv[..., 0].astype(np.int16)
-        sat = hsv[..., 1].astype(np.int16)
-        val = hsv[..., 2].astype(np.int16)
-        cr = ycbcr[..., 1].astype(np.int16)
-        cb = ycbcr[..., 2].astype(np.int16)
-
-        return {
-            "brightness": int(gray.mean()),
-            "contrast": int(gray.std()),
-            "dark_ratio": int((val <= 45).mean() * 100),
-            "bright_ratio": int((val >= 210).mean() * 100),
-            "fog_ratio": int(((sat <= 45) & (val >= 70) & (val <= 220)).mean() * 100),
-            "orange_ratio": round(float((((hue >= 8) & (hue <= 30) & (sat >= 90) & (val >= 80)).mean()) * 100), 2),
-            "red_ratio": round(float(((((hue <= 8) | (hue >= 245)) & (sat >= 100) & (val >= 80)).mean()) * 100), 2),
-            "gold_ratio": round(float((((hue >= 20) & (hue <= 45) & (sat >= 70) & (val >= 90)).mean()) * 100), 2),
-            "skin_ratio": round(float((((cr >= 135) & (cr <= 180) & (cb >= 85) & (cb <= 150)).mean()) * 100), 2),
-            "edge_strength": round(float((np.abs(np.diff(gray, axis=0)).mean() + np.abs(np.diff(gray, axis=1)).mean()) / 2), 2),
-        }
+    _GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+    _GEMINI_MODEL = os.environ.get("GEMINI_VIDEO_MODEL", "gemini-2.5-flash-lite")
+    _GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta"
 
     @staticmethod
-    def _frame_visual_cues(metrics, motion_score=0.0):
-        """把数值特征转成更容易被语言模型利用的线索。"""
-        cues = []
-        if metrics["dark_ratio"] >= 55 and metrics["fog_ratio"] >= 15:
-            cues.append("暗色烟雾/棚拍布光")
-        elif metrics["dark_ratio"] >= 70:
-            cues.append("暗场打光为主")
-
-        if metrics["skin_ratio"] >= 6:
-            cues.append("人物近景明显")
-        elif metrics["skin_ratio"] >= 1:
-            cues.append("疑似人物出镜")
-
-        if metrics["orange_ratio"] >= 1.0:
-            cues.append("疑似篮球或橙色球体元素")
-        if metrics["red_ratio"] >= 1.0:
-            cues.append("疑似篮圈/红色道具元素")
-        if metrics["gold_ratio"] >= 1.0:
-            cues.append("金色球衣/字样元素")
-
-        if metrics["bright_ratio"] >= 12 and metrics["dark_ratio"] >= 20:
-            cues.append("明暗反差强")
-        if metrics["contrast"] >= 55:
-            cues.append("画面对比度高")
-        if motion_score >= 18:
-            cues.append("动作变化明显")
-
-        return cues
-
-    @staticmethod
-    def _analyze_video_frames(video_path):
-        """从视频中提取关键帧并分析，生成文字描述供 AI 评分。"""
-        try:
-            from moviepy import VideoFileClip
-            from PIL import Image
-            import numpy as np
-
-            clip = VideoFileClip(video_path)
-            dur = clip.duration
-            analysis = []
-            analysis.append(f"视频总时长: {dur:.1f}秒, 分辨率: {clip.size[0]}x{clip.size[1]}, FPS: {clip.fps}")
-
-            # 抽取5个时间点的帧
-            times = [0.5, dur * 0.25, dur * 0.5, dur * 0.75, max(dur - 1, 0.5)]
-            frame_metrics = []
-            prev_frame = None
-            for i, t in enumerate(times):
-                if t >= dur:
+    def _analyze_video_gemini(video_path, prompt):
+        """用 Gemini 直传视频文件进行分析，返回文本结果。"""
+        api_key = os.environ.get("GEMINI_API_KEY", "") or _BaseAssistant._GEMINI_API_KEY
+        if not api_key:
+            print("  [Gemini] 未设置 GEMINI_API_KEY，跳过")
+            return ""
+        file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+        model = _BaseAssistant._GEMINI_MODEL
+        print(f"  [Gemini] 开始分析视频 ({file_size_mb:.1f}MB), 模型: {model}")
+        with open(video_path, "rb") as f:
+            video_b64 = base64.standard_b64encode(f.read()).decode()
+        body = json.dumps({
+            "contents": [{
+                "parts": [
+                    {"text": prompt},
+                    {"inline_data": {"mime_type": "video/mp4", "data": video_b64}},
+                ]
+            }]
+        }).encode("utf-8")
+        import time as _t
+        _start = _t.time()
+        url = f"{_BaseAssistant._GEMINI_ENDPOINT}/models/{model}:generateContent?key={api_key}"
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                elapsed = _t.time() - _start
+                for c in data.get("candidates", []):
+                    for p in c.get("content", {}).get("parts", []):
+                        if "text" in p:
+                            result = p["text"].strip()
+                            print(f"  [Gemini] 分析完成，耗时 {elapsed:.1f}s，结果长度: {len(result)} 字符")
+                            return result
+                print(f"  [Gemini] 返回无文本内容，耗时 {elapsed:.1f}s")
+                return ""
+            except urllib.error.HTTPError as e:
+                elapsed = _t.time() - _start
+                err_body = e.read().decode("utf-8")[:200]
+                if e.code in (429, 503) and attempt < 2:
+                    wait = (attempt + 1) * 15
+                    print(f"  [Gemini] HTTP {e.code}，{wait}s 后重试 ({attempt+1}/3)")
+                    _t.sleep(wait)
+                    # 重建 request（read 后原 request 不可复用）
+                    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
                     continue
-                frame = clip.get_frame(min(t, dur - 0.1))
-                img = Image.fromarray(frame)
-                metrics = _BaseAssistant._frame_visual_metrics(img)
-                motion_score = 0.0
-                if prev_frame is not None:
-                    motion_score = float(np.mean(np.abs(frame.astype(np.int16) - prev_frame.astype(np.int16))))
-                prev_frame = frame.astype(np.int16)
+                print(f"  [Gemini] HTTP {e.code} 错误 ({elapsed:.1f}s): {err_body}")
+                raise
+            except Exception as e:
+                elapsed = _t.time() - _start
+                print(f"  [Gemini] 失败 ({elapsed:.1f}s): {e}")
+                raise
+        return ""
 
-                frame_metrics.append((t, metrics, motion_score))
-                cues = _BaseAssistant._frame_visual_cues(metrics, motion_score)
+    # ── 抽帧工具 ────────────────────────────────────────────
 
-                desc = (
-                    f"帧{i+1} ({t:.1f}s): 亮度={metrics['brightness']}, 对比度={metrics['contrast']}, "
-                    f"暗区占比={metrics['dark_ratio']}%, 雾化感={metrics['fog_ratio']}%"
-                )
-                if cues:
-                    desc += ", 线索=" + "、".join(cues)
-                if t < 3:
-                    desc += ", 开头画面"
-                elif t > dur - 2:
-                    desc += ", 结尾画面"
+    @staticmethod
+    def _extract_frames_b64(video_path, n=8, frame_times=None):
+        """从视频抽取帧，返回 JPEG base64 列表。可指定精确时间点。"""
+        import io as _io
+        from moviepy import VideoFileClip
+        from PIL import Image
 
-                analysis.append(desc)
+        clip = VideoFileClip(video_path)
+        dur = clip.duration
+        if frame_times:
+            times = [t for t in frame_times if 0 <= t < dur]
+        else:
+            times = [0.5] + [dur * i / n for i in range(1, n)] + [max(dur - 1, 0.5)]
+            times = sorted(set(t for t in times if t < dur))[:n]
+        images = []
+        for t in times:
+            frame = clip.get_frame(min(t, dur - 0.1))
+            buf = _io.BytesIO()
+            Image.fromarray(frame).save(buf, format="JPEG", quality=80)
+            images.append(base64.standard_b64encode(buf.getvalue()).decode())
+        clip.close()
+        return images
 
-            if frame_metrics:
-                basketball_frames = sum(
-                    1 for _, metrics, _ in frame_metrics
-                    if metrics["orange_ratio"] >= 1.0 or metrics["red_ratio"] >= 1.0 or metrics["gold_ratio"] >= 1.0
-                )
-                portrait_frames = sum(1 for _, metrics, _ in frame_metrics if metrics["skin_ratio"] >= 1.0)
-                studio_frames = sum(1 for _, metrics, _ in frame_metrics if metrics["dark_ratio"] >= 55 and metrics["fog_ratio"] >= 15)
-                dynamic_frames = sum(1 for _, _, motion in frame_metrics if motion >= 18)
+    @staticmethod
+    def _extract_audio_b64(video_path, max_seconds=30):
+        """从视频提取音频，返回 mp3 base64 字符串。无音频返回空字符串。"""
+        import tempfile
+        from moviepy import VideoFileClip
 
-                summary_cues = []
-                if basketball_frames >= 2:
-                    summary_cues.append(f"篮球相关视觉线索出现在 {basketball_frames}/{len(frame_metrics)} 帧")
-                if portrait_frames >= 2:
-                    summary_cues.append(f"人物主体较明显 ({portrait_frames}/{len(frame_metrics)} 帧)")
-                if studio_frames >= 2:
-                    summary_cues.append(f"暗色烟雾/棚拍风格明显 ({studio_frames}/{len(frame_metrics)} 帧)")
-                if dynamic_frames >= 2:
-                    summary_cues.append(f"动作切换较多 ({dynamic_frames}/{len(frame_metrics)} 帧)")
-                if studio_frames >= 2 and basketball_frames >= 2:
-                    summary_cues.append("整体更像电影感/广告式篮球宣传片，不像比赛直播截取")
-
-                if summary_cues:
-                    analysis.append("整体视觉总结: " + "；".join(summary_cues))
-
-            # 音频分析
-            if clip.audio:
-                analysis.append(f"有音频轨道, 音频时长: {clip.audio.duration:.1f}秒")
-            else:
-                analysis.append("无音频轨道")
-
+        clip = VideoFileClip(video_path)
+        if not clip.audio:
             clip.close()
-            return "\n".join(analysis)
-        except Exception as e:
-            return f"视频分析失败: {e}"
+            return ""
+        audio = clip.audio
+        if audio.duration > max_seconds:
+            audio = audio.subclipped(0, max_seconds)
+        tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+        tmp.close()
+        try:
+            audio.write_audiofile(tmp.name, logger=None, bitrate="64k")
+            with open(tmp.name, "rb") as f:
+                result = base64.standard_b64encode(f.read()).decode()
+        finally:
+            clip.close()
+            os.unlink(tmp.name)
+        return result
+
+    # ── Claude 抽帧+音频分析 ──────────────────────────────────
+
+    _CLAUDE_VISION_ENDPOINT = os.environ.get(
+        "CLAUDE_VISION_ENDPOINT",
+        "http://localhost:23333/api/anthropic/v1/messages",
+    )
+    _CLAUDE_VISION_MODEL = os.environ.get("CLAUDE_VISION_MODEL", "claude-opus-4-6")
+
+    @staticmethod
+    def _analyze_video_claude_frames(video_path, prompt, frame_times=None):
+        """抽取帧 + 音频发送给 Claude 视觉模型进行分析。可指定精确抽帧时间点。"""
+        import time as _t
+        _start = _t.time()
+        n_frames = len(frame_times) if frame_times else 8
+        print(f"  [Claude Vision] 抽取 {n_frames} 帧" + (f" (指定时间点)" if frame_times else ""))
+        frames = _BaseAssistant._extract_frames_b64(video_path, n=8, frame_times=frame_times)
+        audio_b64 = _BaseAssistant._extract_audio_b64(video_path)
+        print(f"  [Claude Vision] 帧提取完成: {len(frames)} 帧, 音频: {'有' if audio_b64 else '无'}, 模型: {_BaseAssistant._CLAUDE_VISION_MODEL}")
+
+        content = [{"type": "text", "text": prompt}]
+        for b64 in frames:
+            content.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
+            })
+        if audio_b64:
+            content.append({
+                "type": "input_audio",
+                "source": {"type": "base64", "media_type": "audio/mp3", "data": audio_b64},
+            })
+
+        body = json.dumps({
+            "model": _BaseAssistant._CLAUDE_VISION_MODEL,
+            "max_tokens": 800,
+            "messages": [{"role": "user", "content": content}],
+        }).encode("utf-8")
+
+        for attempt in range(3):
+            req = urllib.request.Request(
+                _BaseAssistant._CLAUDE_VISION_ENDPOINT,
+                data=body,
+                headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                elapsed = _t.time() - _start
+                for block in data.get("content", []):
+                    if block.get("type") == "text":
+                        result = block["text"].strip()
+                        print(f"  [Claude Vision] 分析完成，耗时 {elapsed:.1f}s，结果长度: {len(result)} 字符")
+                        return result
+                print(f"  [Claude Vision] 返回无文本内容，耗时 {elapsed:.1f}s")
+                return ""
+            except Exception as e:
+                elapsed = _t.time() - _start
+                if attempt < 2:
+                    wait = (attempt + 1) * 10
+                    print(f"  [Claude Vision] 尝试{attempt+1}/3 失败 ({elapsed:.1f}s): {e}，{wait}s 后重试")
+                    _t.sleep(wait)
+                else:
+                    print(f"  [Claude Vision] 3次尝试均失败 ({elapsed:.1f}s): {e}")
+                    raise
+
+    # ── GPT 抽帧分析 fallback ─────────────────────────────────
+
+    @staticmethod
+    def _analyze_video_frames_gpt(video_path, prompt, endpoint_url, headers):
+        """抽取 8 帧发送给 GPT-4o 视觉模型进行分析（fallback）。"""
+        frames = _BaseAssistant._extract_frames_b64(video_path, n=8)
+        content = [{"type": "text", "text": prompt}]
+        for b64 in frames:
+            content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+
+        body = json.dumps({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": 500,
+        }).encode("utf-8")
+        req = urllib.request.Request(url=endpoint_url, data=body, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return data["choices"][0]["message"]["content"].strip()
 
     def polish_translation(self, original_text, raw_translation):
         """优化翻译，使其更自然流畅、适合短视频展示"""
@@ -179,29 +238,94 @@ class _BaseAssistant:
         return result.strip().strip('"').strip("'") if result else raw_translation
 
     def analyze_video_content(self, video_path, original_text="", author=""):
-        """分析推文自带视频的内容，返回视频描述供解说词生成参考"""
-        frame_analysis = self._analyze_video_frames(video_path)
-        if "失败" in frame_analysis:
-            return ""
-        prompt = (
-            f"你是NBA短视频分析师。请优先依据视频画面本身的线索，而不是机械复述推文原文。\n"
-            f"如果画面里没有直接证据，不要擅自补出具体电影名、品牌名、合作对象或剧情。\n"
-            f"可以参考推文信息理解背景，但输出必须以画面中真正可见的主体、动作、道具、风格为主。\n\n"
-            f"=== 视频帧技术分析 ===\n{frame_analysis}\n\n"
-            f"=== 推文信息 ===\n"
-            f"作者: {author}\n"
-            f"推文原文: {original_text}\n\n"
-            f"请用中文描述：\n"
-            f"1. 先说画面里直接可见的主体、动作、道具、镜头风格\n"
-            f"2. 再判断最可能的视频类型（比赛片段、训练、广告、采访、电影感宣传片等）\n"
-            f"3. 如果不确定，用'像''疑似''更像'表达，不要装作确定\n"
-            f"4. 除非视觉线索足够强，否则不要直接搬用推文里的片名或 IP 名称\n"
-            f"5. 50字以内，只返回描述。"
-        )
-        result = self._call(prompt)
-        return result.strip() if result else ""
+        """双 Agent 视频分析：Gemini 直传 + Claude 抽帧+音频，最后总结合并。"""
+        import concurrent.futures
 
-    def generate_commentary(self, original_text, translation, author="", has_video=False, video_description=""):
+        ref_info = f"参考信息 — 作者: {author}，推文原文: {original_text}" if (author or original_text) else ""
+
+        gemini_prompt = (
+            f"你是专业短视频内容分析师。请分析这个视频讲述的内容和事件：\n"
+            f"1. 视频在讲什么事件/新闻/故事？涉及哪些人物？\n"
+            f"2. 视频中出现的文字、字幕、旁白说了什么？请转录关键对话。\n"
+            f"3. 这个事件的背景和意义是什么？\n"
+            f"{ref_info}\n200字以内，用中文，只返回描述。"
+        )
+        claude_prompt = (
+            f"你是专业短视频内容分析师。以下是一个视频的关键帧截图和音频。\n"
+            f"请分析：\n"
+            f"1. 画面中出现的人物（如能识别身份请指出）、场景、动作\n"
+            f"2. 画面中出现的所有文字、字幕、标题、品牌logo\n"
+            f"3. 音频中的对话/旁白（请转录原文）\n"
+            f"4. 音频的音乐风格和氛围\n"
+            f"{ref_info}\n200字以内，用中文。"
+        )
+
+        gemini_result = ""
+        claude_result = ""
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = {}
+            if self._GEMINI_API_KEY:
+                self._log("视频分析: 启动 Gemini 直传视频 agent")
+                futures["gemini"] = pool.submit(self._analyze_video_gemini, video_path, gemini_prompt)
+            self._log("视频分析: 启动 Claude 抽帧+音频 agent")
+            futures["claude"] = pool.submit(self._analyze_video_claude_frames, video_path, claude_prompt)
+
+            for name, f in futures.items():
+                try:
+                    result = f.result(timeout=150)
+                    if name == "gemini":
+                        gemini_result = result or ""
+                    else:
+                        claude_result = result or ""
+                    if result:
+                        self._log(f"视频分析: {name} agent 完成")
+                    else:
+                        self._log(f"视频分析: {name} agent 返回为空", "warn")
+                except Exception as e:
+                    self._log(f"视频分析: {name} agent 失败: {e}", "warn")
+
+        # 只有一个成功 → 直接返回
+        if gemini_result and not claude_result:
+            return gemini_result
+        if claude_result and not gemini_result:
+            return claude_result
+
+        # 两个都成功 → 总结 agent 合并
+        if gemini_result and claude_result:
+            self._log("视频分析: 启动总结 agent 合并结果")
+            summary_prompt = (
+                f"你是内容编辑。以下是两个AI对同一视频的分析结果。\n"
+                f"Gemini 能听到完整音频和看到连续画面，Claude 的画面细节更精准。\n"
+                f"请综合两者，取各自之长，去除重复和矛盾，输出200字以内的最终视频内容描述。\n\n"
+                f"=== Gemini 分析（含音频）===\n{gemini_result}\n\n"
+                f"=== Claude 分析（画面细节）===\n{claude_result}\n\n"
+                f"{ref_info}"
+            )
+            result = self._call(summary_prompt)
+            if result and result.strip():
+                return result.strip()
+            return gemini_result  # 总结失败则返回 Gemini 结果
+
+        # 都失败 → fallback GPT-4o 抽帧
+        gpt_endpoint = os.environ.get("GPT_VISION_ENDPOINT", "http://localhost:23333/api/openai/v1/chat/completions")
+        fallback_prompt = (
+            f"你是专业短视频内容分析师。以下是一个视频的关键帧截图。\n"
+            f"请分析视频内容：人物、事件、文字、背景。\n"
+            f"{ref_info}\n200字以内，用中文。"
+        )
+        try:
+            self._log("视频分析: 双 agent 均失败，fallback 到 GPT-4o 抽帧")
+            return self._analyze_video_frames_gpt(
+                video_path, fallback_prompt,
+                endpoint_url=gpt_endpoint,
+                headers={"Content-Type": "application/json"},
+            )
+        except Exception as e:
+            self._log(f"视频分析: GPT-4o fallback 也失败: {e}", "error")
+            return ""
+
+    def generate_commentary(self, original_text, translation, author="", has_video=False, video_description="", target_duration=0):
         """生成解说词（不是简单翻译，而是有解说感的旁白）"""
         try:
             from .style_guide import STYLE_EXAMPLES, COMMENTARY_RULES, PLAYER_NICKNAMES, FORBIDDEN_WORDS
@@ -227,25 +351,46 @@ class _BaseAssistant:
             if video_description:
                 video_hint += f"视频内容分析：{video_description}\n"
 
+        # 根据视频时长计算目标字数（中文 TTS 约 4 字/秒，预留首尾各 1.5s）
+        if target_duration > 0:
+            available_seconds = max(target_duration - 3, 8)
+            target_chars = int(available_seconds * 4)
+            min_chars = max(target_chars - 20, 60)
+            max_chars = target_chars + 20
+            length_rule = f"1. {min_chars}-{max_chars}字（视频时长{target_duration:.0f}秒，解说需要贯穿全程），像跟兄弟聊天\n"
+        else:
+            length_rule = f"1. 80-150字，4-6个短句，像跟兄弟聊天\n"
+
         prompt = (
             f"你是篮球邮差Melo风格的NBA短视频博主。请模仿以下范例的解说风格：\n\n"
             f"{examples_text}\n\n"
             f"【核心风格规则】\n"
-            f"1. 80-150字，4-6个短句，像跟兄弟聊天\n"
-            f"2. 开头必须用球星昵称+情绪钩子（如'老詹争议言论持续发酵''真没想到'）\n"
+            f"{length_rule}"
+            f"2. 开头第一句必须是'XXX今日发推'或'XXX今日转推'（用球星昵称），然后紧接情绪钩子\n"
+            f"   例如：'老詹今日发推，直接放出了一段超燃视频。' / '欧文今日转推，力挺好兄弟鲁卡。'\n"
             f"3. 中间引述事件细节，用'他表示''说道'做引用过渡\n"
             f"4. 结尾必须有个人观点/情绪判断/反问，如'真的太善良了''算是得到认可了吗'\n"
             f"5. 事实占45%，个人观点评论占55%\n"
             f"6. 必须使用口语词：真的、太、算是、天啊、好家伙、没得说、直接、拉满\n"
             f"7. 绝对禁用书面套话：{forbidden}\n"
             f"8. 只返回解说词本身，不加引号、标题、解释\n"
+            f"9. 【标点格式强制要求】每个短句必须以句号、感叹号或问号结尾。句内停顿用逗号。"
+            f"禁止用空格代替标点。禁止省略句末标点。\n"
             f"{video_hint}\n"
             f"球星: {author}{nickname_hint}\n"
             f"原文: {original_text}\n"
             f"翻译: {translation}"
         )
         result = self._call(prompt)
-        return result.strip().strip('"').strip("'") if result else translation
+        if result:
+            # 后处理：修复空格分隔的问题，确保标点规范
+            text = result.strip().strip('"').strip("'")
+            # 把中文字符之间的空格替换成逗号（AI 有时用空格代替标点）
+            text = re.sub(r'([\u4e00-\u9fff])\s+([\u4e00-\u9fff])', r'\1，\2', text)
+            # 重复处理（上面的正则一次只替换一对）
+            text = re.sub(r'([\u4e00-\u9fff])\s+([\u4e00-\u9fff])', r'\1，\2', text)
+            return text
+        return translation
 
     def recommend_music_claude(self, blog_content, author=""):
         """推荐最适合的配乐歌曲（英文 prompt，更适合音乐推荐）"""
@@ -263,6 +408,52 @@ class _BaseAssistant:
                 self._log(f"推荐歌曲: {song}")
                 return song
         return None
+
+    def extract_video_dialogue(self, video_description, original_text="", author=""):
+        """从视频分析结果中提取关键对话/旁白并翻译为中文字幕，供静默字幕段使用。"""
+        if not video_description:
+            return []
+        prompt = (
+            f"以下是对一个视频的内容分析。请从中提取视频里的关键对话或旁白，翻译成简短的中文字幕。\n\n"
+            f"=== 视频分析 ===\n{video_description}\n\n"
+            f"要求：\n"
+            f"1. 只提取视频中人物实际说的话（对话/旁白），不要提取画面描述\n"
+            f"2. 每条字幕控制在20字以内\n"
+            f"3. 如果原文是英文，翻译成地道的中文\n"
+            f"4. 如果没有对话/旁白，返回空\n"
+            f"5. 每行一条字幕，不要编号，不要引号\n"
+            f"6. 最多5条"
+        )
+        result = self._call(prompt)
+        if not result or not result.strip():
+            return []
+        lines = [l.strip() for l in result.strip().split("\n") if l.strip() and len(l.strip()) > 2]
+        return lines[:5]
+
+    def select_bgm_from_library(self, tweet_text, translation, author="", bgm_dir=""):
+        """从本地 BGM 库中选择最适合推文内容的背景音乐，返回文件名或空字符串。"""
+        if not bgm_dir or not os.path.isdir(bgm_dir):
+            return ""
+        files = [f for f in os.listdir(bgm_dir) if f.endswith((".ogg", ".mp3", ".wav"))]
+        if not files:
+            return ""
+        file_list = "\n".join(f"- {f}" for f in files)
+        prompt = (
+            f"你是短视频配乐师。根据以下推文内容，从BGM库中选择最合适的一首背景音乐。\n\n"
+            f"推文作者: {author}\n"
+            f"推文原文: {tweet_text}\n"
+            f"翻译: {translation}\n\n"
+            f"可选BGM文件：\n{file_list}\n\n"
+            f"选择标准：根据推文的情绪（励志/感伤/热血/轻松/怀旧等）匹配歌曲风格。\n"
+            f"只返回文件名，不要解释。"
+        )
+        result = self._call(prompt).strip().strip('"').strip("'")
+        # 验证返回的文件名在列表中
+        for f in files:
+            if f in result or os.path.splitext(f)[0] in result:
+                self._log(f"BGM 库选曲: {f}")
+                return f
+        return ""
 
     def recommend_song(self, tweet_text, translation, author=""):
         """推荐一首具体的适合作为背景音乐的歌曲"""
@@ -301,12 +492,89 @@ class _BaseAssistant:
             return result
         return "chill"
 
-    def review_video(self, video_info, video_path=None):
+    def review_video(self, video_info, video_path=None, subtitle_timeline=None):
         """审阅推特短视频质量，以参考视频风格为标杆。"""
-        # 从视频中提取详细信息
-        frame_analysis = ""
+        # 双 agent 分析视频内容
+        video_analysis = ""
+        subtitle_check = ""
         if video_path and os.path.exists(video_path):
-            frame_analysis = self._analyze_video_frames(video_path)
+            import concurrent.futures
+
+            # Gemini review prompt（针对内容质量评审）
+            review_prompt = (
+                f"你是专业短视频审阅员。请从以下维度审阅这个视频：\n\n"
+                f"=== 预期内容 ===\n"
+                f"解说词: {video_info.get('commentary', '')}\n"
+                f"推文原文: {video_info.get('original_text', '')}\n"
+                f"翻译: {video_info.get('translation', '')}\n"
+                f"作者: {video_info.get('author', '')}\n"
+                f"视频内容分析: {video_info.get('video_description', '')}\n\n"
+                f"请严格评估：\n"
+                f"1. 内容准确性【最重要】：解说词是否忠实于推文原文的事实？有无添油加醋、张冠李戴、编造细节？\n"
+                f"2. 视频匹配度：如果有原始推文视频，解说词是否与视频画面内容一致？有无描述了视频中不存在的内容？\n"
+                f"3. 配音内容：旁白说的话是否和解说词一致？有无漏读、错读？\n"
+                f"4. 配音风格：语气是否像跟朋友聊天？还是像念稿？是否有情绪起伏？\n"
+                f"5. 配乐配合：BGM风格是否匹配内容情绪？音量是否合适？\n"
+                f"6. 整体节奏：视频节奏是否流畅？有无尴尬的空白或太赶的部分？\n"
+                f"7. 如果发现事实错误或与推文/视频不符的地方，请明确指出并给出修改建议。\n"
+                f"200字以内，用中文，具体指出问题。"
+            )
+
+            # Claude 精确字幕校对 + 内容评审：按字幕时间点抽帧
+            if subtitle_timeline:
+                frame_times = [start + dur / 2 for _, start, dur in subtitle_timeline]
+                checklist = "\n".join(
+                    f"帧{i+1} ({frame_times[i]:.1f}s): 预期字幕「{text}」"
+                    for i, (text, _, _) in enumerate(subtitle_timeline)
+                )
+                claude_prompt = (
+                    f"你是短视频审阅员。以下是一个视频的关键帧截图（每帧对应一条字幕）和音频。\n\n"
+                    f"=== 预期内容 ===\n"
+                    f"解说词: {video_info.get('commentary', '')}\n"
+                    f"推文原文: {video_info.get('original_text', '')}\n"
+                    f"翻译: {video_info.get('translation', '')}\n"
+                    f"作者: {video_info.get('author', '')}\n\n"
+                    f"=== 字幕校对清单 ===\n{checklist}\n\n"
+                    f"请完成两项任务：\n\n"
+                    f"【任务1: 字幕校对】\n"
+                    f"逐帧对比画面中实际显示的字幕和预期字幕，报告不匹配。\n\n"
+                    f"【任务2: 内容评审】\n"
+                    f"1. 画面中的人物、场景是否与解说词描述一致？\n"
+                    f"2. 解说词有无编造画面中不存在的内容？\n"
+                    f"3. 解说词是否忠实于推文原文的事实？\n"
+                    f"4. 字幕位置、大小、可读性如何？\n\n"
+                    f"请分两部分回答：先字幕校对结果，再内容评审意见。"
+                )
+            else:
+                frame_times = None
+                claude_prompt = review_prompt
+
+            gemini_result = ""
+            claude_result = ""
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                futures = {}
+                if self._GEMINI_API_KEY:
+                    futures["gemini"] = pool.submit(self._analyze_video_gemini, video_path, review_prompt)
+                futures["claude"] = pool.submit(
+                    self._analyze_video_claude_frames, video_path, claude_prompt,
+                    frame_times)
+                for name, f in futures.items():
+                    try:
+                        r = f.result(timeout=150)
+                        if name == "gemini":
+                            gemini_result = r or ""
+                        else:
+                            claude_result = r or ""
+                    except Exception:
+                        pass
+
+            if subtitle_timeline:
+                subtitle_check = claude_result
+                video_analysis = gemini_result
+            elif gemini_result and claude_result:
+                video_analysis = f"[Gemini] {gemini_result}\n[Claude] {claude_result}"
+            else:
+                video_analysis = gemini_result or claude_result
 
         # 加载风格参考
         try:
@@ -333,28 +601,79 @@ class _BaseAssistant:
             f"文件大小: {video_info.get('file_size_mb', 0)}MB\n"
             f"有原始推文视频: {video_info.get('has_source_video', False)}\n\n"
         )
-        if frame_analysis:
-            prompt += f"=== 视频帧分析 ===\n{frame_analysis}\n\n"
+        if video_analysis:
+            prompt += f"=== 视频内容分析 ===\n{video_analysis}\n\n"
+        if subtitle_check:
+            prompt += f"=== 字幕校对结果（Claude 逐帧比对）===\n{subtitle_check}\n\n"
 
         prompt += (
-            f"严格评分标准（满分100，90分以上才算A级合格）：\n"
-            f"1. 解说风格匹配度（35分）：\n"
-            f"   - 是否用球星昵称开头+情绪钩子？（10分）\n"
-            f"   - 是否有个人观点/吐槽/反问结尾？（10分）\n"
-            f"   - 事实vs评论比例是否约45:55？（5分）\n"
-            f"   - 是否使用口语词（真的、太、算是、天啊等）？（5分）\n"
-            f"   - 是否避免了书面套话（{forbidden}）？（5分）\n"
-            f"2. 配乐质量（20分）：是否用了真实歌曲（合成音最高5分），风格是否匹配\n"
-            f"3. 配音效果（15分）：语音自然度，与配乐分层是否清晰\n"
-            f"4. 视觉效果（15分）：画面清晰度，截图→视频过渡，字幕位置\n"
-            f"5. 内容趣味（15分）：是否有信息增量、让人想看完，像跟朋友聊天不像念稿\n\n"
+            f"严格评分标准（满分100，90分以上才算A级合格，大部分视频应在60-80分）：\n"
+            f"【评分纪律】不要给人情分。没有明确证据表现优秀的项目，给中等分而非高分。\n"
+            f"只有各项都真正出色才能达到90+。首轮生成几乎不可能达到A级。\n\n"
+            f"1. 内容准确性（25分）【一票否决项】：\n"
+            f"   - 解说词是否忠实于推文原文？有无编造、夸大、张冠李戴？（15分）\n"
+            f"   - 如果有视频，解说词是否与视频画面一致？（5分）\n"
+            f"   - 字幕与解说词是否完全匹配？（5分）\n"
+            f"   - 存在事实错误则此项直接0分\n"
+            f"2. 解说风格匹配度（25分）：\n"
+            f"   - 是否用球星昵称开头+情绪钩子？（8分）\n"
+            f"   - 是否有个人观点/吐槽/反问结尾？（7分）\n"
+            f"   - 事实vs评论比例是否约45:55？（4分）\n"
+            f"   - 是否使用口语词（真的、太、算是、天啊等）？（3分）\n"
+            f"   - 是否避免了书面套话（{forbidden}）？（3分）\n"
+            f"3. 配乐质量（15分）：风格是否匹配内容情绪，音量比例是否合适\n"
+            f"4. 配音效果（15分）：语音自然度，与配乐分层是否清晰\n"
+            f"5. 视觉效果（10分）：画面清晰度，截图→视频过渡，字幕位置和可读性\n"
+            f"6. 内容趣味（10分）：是否有信息增量、让人想看完，像跟朋友聊天不像念稿\n\n"
             f"请严格按以下JSON格式返回：\n"
-            f'{{"score": 85, "grade": "B", '
-            f'"details": {{"解说风格": 20, "配乐质量": 15, "配音效果": 12, "视觉效果": 16, "内容趣味": 13}}, '
+            f'{{"score": 68, "grade": "C", '
+            f'"details": {{"内容准确性": 18, "解说风格": 16, "配乐质量": 10, "配音效果": 10, "视觉效果": 7, "内容趣味": 7}}, '
+            f'"subtitle_mismatches": ["第2句字幕显示XXX但解说词是YYY"], '
+            f'"content_issues": ["解说词提到XXX但推文原文并未提及"], '
             f'"suggestions": ["具体建议1", "具体建议2"]}}'
         )
-        system = "你是专业短视频审阅员。必须以纯JSON格式返回结果，不要包含markdown代码块标记。"
-        result = self._call(prompt, system=system)
+
+        # 最终评分 agent 也抽 8 帧+音频看视频，不能只看文本
+        if video_path and os.path.exists(video_path):
+            frames = self._extract_frames_b64(video_path, n=8)
+            audio_b64 = self._extract_audio_b64(video_path)
+            content = [{"type": "text", "text": prompt}]
+            for b64 in frames:
+                content.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
+                })
+            if audio_b64:
+                content.append({
+                    "type": "input_audio",
+                    "source": {"type": "base64", "media_type": "audio/mp3", "data": audio_b64},
+                })
+            body = json.dumps({
+                "model": self._CLAUDE_VISION_MODEL,
+                "max_tokens": 800,
+                "messages": [{"role": "user", "content": content}],
+            }).encode("utf-8")
+            system_msg = "你是专业短视频审阅员。必须以纯JSON格式返回结果，不要包含markdown代码块标记。评分要严格，不要给人情分。"
+            req = urllib.request.Request(
+                self._CLAUDE_VISION_ENDPOINT,
+                data=body,
+                headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                for block in data.get("content", []):
+                    if block.get("type") == "text":
+                        result = block["text"]
+                        break
+                else:
+                    result = ""
+            except Exception:
+                result = self._call(prompt, system=system_msg)
+        else:
+            system_msg = "你是专业短视频审阅员。必须以纯JSON格式返回结果，不要包含markdown代码块标记。评分要严格，不要给人情分。"
+            result = self._call(prompt, system=system_msg)
 
         try:
             cleaned = result.strip()
@@ -386,54 +705,50 @@ class _BaseAssistant:
 
 
 class ClaudeAssistant(_BaseAssistant):
-    """Claude CLI 后端"""
+    """Claude 后端 — 通过 Agent Maestro Anthropic 端点调用"""
 
     CLAUDE_MODEL = "claude-opus-4-6"
 
     def __init__(self):
-        # 查找 claude 可执行文件路径
-        import shutil
-        self._claude_cmd = shutil.which("claude") or shutil.which("claude.cmd")
-        if not self._claude_cmd:
-            # 常见 npm 全局安装路径
-            npm_path = os.path.join(os.environ.get("APPDATA", ""), "npm", "claude.cmd")
-            if os.path.exists(npm_path):
-                self._claude_cmd = npm_path
-            else:
-                self._claude_cmd = "claude"
-        self._log(f"Claude CLI 路径: {self._claude_cmd}")
+        self._endpoint = os.environ.get(
+            "CLAUDE_API_ENDPOINT",
+            "http://localhost:23333/api/anthropic/v1/messages",
+        )
+        self._model = os.environ.get("CLAUDE_MODEL", self.CLAUDE_MODEL)
+        self._log(f"Claude API 端点: {self._endpoint}")
 
     def _call(self, prompt, system="你是一个专业的NBA篮球内容编辑和翻译。"):
-        full_prompt = f"{system}\n\n{prompt}"
-        if len(full_prompt) > 4000:
-            full_prompt = full_prompt[:4000]
-        env = os.environ.copy()
-        env["PYTHONIOENCODING"] = "utf-8"
-        import time as _time
+        body = json.dumps({
+            "model": self._model,
+            "max_tokens": 1024,
+            "system": system,
+            "messages": [{"role": "user", "content": prompt}],
+        }).encode("utf-8")
+
         for attempt in range(3):
+            req = urllib.request.Request(
+                self._endpoint,
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "anthropic-version": "2023-06-01",
+                },
+                method="POST",
+            )
             try:
-                _time.sleep(2)
-                result = subprocess.run(
-                    [self._claude_cmd, "--bare",
-                     "--model", self.CLAUDE_MODEL],
-                    input=full_prompt,
-                    capture_output=True, text=True, timeout=60,
-                    encoding="utf-8", env=env,
-                )
-                if result.returncode == 0 and result.stdout.strip():
-                    return result.stdout.strip()
-                if result.returncode != 0:
-                    self._log(f"Claude CLI 尝试{attempt+1}/3 返回码={result.returncode}", "warn")
-                else:
-                    self._log(f"Claude CLI 尝试{attempt+1}/3 返回为空", "warn")
-            except subprocess.TimeoutExpired:
-                self._log(f"Claude CLI 尝试{attempt+1}/3 超时(60s)", "warn")
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                for block in data.get("content", []):
+                    if block.get("type") == "text":
+                        return block["text"].strip()
+                return ""
             except Exception as e:
-                self._log(f"Claude CLI 尝试{attempt+1}/3 失败: {e}", "error")
-                break
-            import time as _time
-            _time.sleep(1)
-        self._log("Claude CLI 3次尝试均失败", "error")
+                wait = (attempt + 1) * 10  # 10s, 20s, 30s
+                self._log(f"Claude API 尝试{attempt+1}/3 失败: {e}，{wait}s 后重试", "warn")
+                if attempt < 2:
+                    import time
+                    time.sleep(wait)
+        self._log("Claude API 3次尝试均失败", "error")
         return ""
 
 

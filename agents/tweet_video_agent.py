@@ -3,6 +3,8 @@
 """
 import os
 import re
+import warnings
+warnings.filterwarnings("ignore", message=".*bytes wanted but 0 bytes read.*")
 import uuid
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -114,7 +116,8 @@ class TweetVideoAgent:
         os.makedirs(self.audio_dir, exist_ok=True)
         self.music = MusicProvider(self.audio_dir)
         self.music_searcher = MusicSearcher()
-        self.voice = VoiceActor(self.audio_dir, voice="zh-CN-YunyangNeural")
+        self.voice = VoiceActor(self.audio_dir, voice="zh-CN-YunxiNeural")
+        self.last_subtitle_timeline = []  # [(text, start_time, duration)]
 
     def _create_frame(self, screenshot_path, translation="", author=""):
         """
@@ -212,25 +215,38 @@ class TweetVideoAgent:
 
     @staticmethod
     def _split_sentences(text):
-        """将解说词拆分为短句，用于逐句展示字幕"""
+        """将解说词拆分为短句，用于逐句展示字幕。保持语义完整，不过度拆分。"""
         clean = _strip_emoji(text).strip()
         if not clean:
             return []
-        # 先按强停顿切句，再把缺少标点的长句继续切块
+        # 先按强停顿切句（句号、感叹号、问号、分号、换行）
         parts = re.split(r'[。！？!?；;\n]+', clean)
         sentences = []
         for p in parts:
             p = p.strip()
             if not p:
                 continue
-            sub_parts = [s.strip() for s in re.split(r'[，、,:：]+', p) if s.strip()]
-            if not sub_parts:
-                continue
-            for part in sub_parts:
-                if len(part) > 20:
-                    sentences.extend(TweetVideoAgent._chunk_subtitle_text(part, max_len=20))
-                else:
-                    sentences.append(part)
+            # 如果段落 >20 字，按逗号拆分并合并短片段
+            if len(p) > 20:
+                sub_parts = [s.strip() for s in re.split(r'[，,]+', p) if s.strip()]
+                merged = []
+                buf = ""
+                for sp in sub_parts:
+                    if buf:
+                        buf += "，" + sp
+                    else:
+                        buf = sp
+                    if len(buf) >= 12:
+                        merged.append(buf)
+                        buf = ""
+                if buf:
+                    if merged:
+                        merged[-1] += "，" + buf
+                    else:
+                        merged.append(buf)
+                sentences.extend(merged)
+            else:
+                sentences.append(p)
         return sentences
 
     def _render_subtitle_frame(self, text, width=WIDTH, height=160):
@@ -270,6 +286,9 @@ class TweetVideoAgent:
         from moviepy import VideoFileClip
         clip = VideoFileClip(video_path)
 
+        # 末尾留 0.1s 余量，避免读到不完整帧
+        clip = clip.with_duration(clip.duration - 0.1)
+
         w, h = clip.size
         target_ratio = WIDTH / HEIGHT  # 0.5625
 
@@ -290,7 +309,8 @@ class TweetVideoAgent:
 
         if target_duration:
             if clip.duration < target_duration:
-                clip = clip.with_effects([vfx.Loop(duration=target_duration)])
+                # 视频不够长时冻结最后一帧，不要循环重复
+                clip = clip.with_effects([vfx.Freeze(t="end", total_duration=target_duration)])
             else:
                 clip = clip.with_duration(target_duration)
 
@@ -298,7 +318,7 @@ class TweetVideoAgent:
 
     def generate(self, images, translations, authors=None, mood="chill",
                  duration=12.0, output_name=None, commentary=None,
-                 song_query=None, source_video=None):
+                 song_query=None, source_video=None, video_subtitles=None):
         """
         生成推特短视频（逐句字幕版）
         
@@ -324,15 +344,18 @@ class TweetVideoAgent:
         elif len(authors) < len(images):
             authors = authors + [""] * (len(images) - len(authors))
 
-        # 1. 拆分解说词为短句，逐句生成 TTS
+        # 1. 构建字幕序列：解说词(有TTS) + 视频字幕(无TTS，静默展示)
         narration_texts = commentary if commentary else translations
         full_text = narration_texts[0] if narration_texts else ""
         sentences = self._split_sentences(full_text)
         if not sentences:
             sentences = ["请关注详细内容"]
 
-        # 为每句话生成 TTS
-        sentence_audio = []  # [(sentence_text, audio_path, duration)]
+        # sentence_audio: [(text, audio_path_or_None, duration)]
+        # audio_path=None 表示静默字幕段（仅显示翻译，不配音）
+        sentence_audio = []
+
+        # 为解说词生成 TTS
         for i, sent in enumerate(sentences):
             tts_file = f"tts_{uuid.uuid4().hex[:8]}.mp3"
             try:
@@ -344,22 +367,99 @@ class TweetVideoAgent:
             except Exception:
                 pass
 
-        # 计算总配音时长
+        # 如果有源视频且提供了 video_subtitles，在解说词之后追加静默字幕
+        _video_subs = video_subtitles or []
+        if _video_subs and source_video:
+            for vs in _video_subs:
+                vs = vs.strip().strip("（）()\"'")
+                # 过滤无意义的字幕
+                if not vs or len(vs) < 3:
+                    continue
+                vs_lower = vs.replace(" ", "")
+                if any(kw in vs_lower for kw in ["无对话", "无旁白", "无字幕", "无语音", "无内容", "静音"]):
+                    continue
+                sentence_audio.append((vs, None, 3.0))
+
+        # 计算总时长（包括静默字幕段）
         narration_dur = sum(d for _, _, d in sentence_audio)
 
-        # 视频时长 = max(配音时长 + 3秒缓冲, 原始 duration)
+        # 视频时长：有源视频时以源视频为准，不允许解说超出
         actual_duration = max(narration_dur + 3.0, duration)
+        if source_video and os.path.exists(source_video):
+            from moviepy import VideoFileClip as _VFC
+            _src = _VFC(source_video)
+            src_dur = _src.duration
+            _src.close()
+            actual_duration = src_dur + 5.0  # 5秒开场 + 完整源视频
 
-        # 2. 获取背景音乐
+            # 解说词不能超过视频时长，超过则重新生成更短的解说词
+            max_narration = actual_duration - 3.0  # 留首尾各1.5s
+            retry_count = 0
+            while narration_dur > max_narration and retry_count < 3:
+                retry_count += 1
+                target_chars = int((max_narration - 2) * 4)  # 留余量
+                print(f"  [Warning] 解说词 {narration_dur:.1f}s 超过视频 {max_narration:.1f}s，重新生成 (第{retry_count}次，目标{target_chars}字)")
+                try:
+                    from agents.ai_assistant import get_assistant
+                    _ai = get_assistant()
+                    shorter = _ai._call(
+                        f"请将以下解说词精简到{target_chars}字以内，保持原有风格和关键信息，"
+                        f"每句用句号结尾。\n\n原文：{full_text}"
+                    )
+                    if shorter and len(shorter.strip()) > 10:
+                        full_text = shorter.strip().strip('"').strip("'")
+                        sentences = self._split_sentences(full_text)
+                        sentence_audio = []
+                        for sent in sentences:
+                            tts_file = f"tts_{uuid.uuid4().hex[:8]}.mp3"
+                            try:
+                                tts_path = self.voice.synthesize_segment(sent, tts_file, version=5)
+                                if tts_path and os.path.exists(tts_path):
+                                    ac = AudioFileClip(tts_path)
+                                    sentence_audio.append((sent, tts_path, ac.duration))
+                                    ac.close()
+                            except Exception:
+                                pass
+                        narration_dur = sum(d for _, _, d in sentence_audio)
+                        print(f"  [Info] 重新生成后解说词 {narration_dur:.1f}s")
+                except Exception as e:
+                    print(f"  [Error] 重新生成失败: {e}")
+                    break
+
+        # 2. 获取背景音乐（AI选曲 → 搜索下载 → 合成）
         bgm_path = None
-        if song_query:
+        _bgm_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "reference_videos", "bgm")
+
+        # 2a. 让 AI 从本地 BGM 库选曲
+        if os.path.isdir(_bgm_dir):
+            try:
+                from agents.ai_assistant import get_assistant
+                _ai = get_assistant()
+                chosen = _ai.select_bgm_from_library(
+                    tweet_text=translations[0] if translations else "",
+                    translation=translations[0] if translations else "",
+                    author=authors[0] if authors else "",
+                    bgm_dir=_bgm_dir,
+                )
+                if chosen:
+                    bgm_path = os.path.join(_bgm_dir, chosen)
+                    if os.path.exists(bgm_path):
+                        print(f"  [Music] AI 选曲: {chosen}")
+                    else:
+                        bgm_path = None
+            except Exception as e:
+                print(f"  [Music] AI 选曲失败: {e}")
+
+        # 2b. 搜索下载
+        if not bgm_path and song_query:
             print(f"  [Music] 搜索: {song_query}")
             bgm_path = self.music_searcher.search_and_download(
                 song_query, duration=int(actual_duration + 5)
             )
             if bgm_path:
-                print(f"  [Music] 已获取真实歌曲配乐")
+                print(f"  [Music] 已获取在线歌曲配乐")
 
+        # 2c. 合成
         if not bgm_path:
             bgm_name = f"bgm_{uuid.uuid4().hex[:8]}.wav"
             bgm_path = self.music.generate(
@@ -404,12 +504,28 @@ class TweetVideoAgent:
             bg_clip = ImageClip(frame_path).with_duration(actual_duration)
             bg_clip = bg_clip.with_effects([vfx.FadeIn(0.5), vfx.FadeOut(0.5)])
 
-        # 4. 构建逐句字幕（读一句展示一句）
+        # 4. 构建逐句字幕（读一句展示一句，均匀分布在视频全程）
         subtitle_clips = []
         sub_bottom_margin = 120
 
-        offset = 1.0  # 配音延迟1秒
+        # 解说从 1s 开始，到视频结束前 2s
+        narration_start = 1.0
+        narration_end = actual_duration - 2.0
+        narration_window = max(narration_end - narration_start, 5.0)
+
+        # 计算总配音时长和自适应间隔
+        total_audio_dur = sum(d for _, _, d in sentence_audio)
+        n_gaps = max(len(sentence_audio) - 1, 1)
+        if total_audio_dur < narration_window:
+            # 有富余时间，均匀分配间隔
+            extra_time = narration_window - total_audio_dur
+            gap = min(extra_time / n_gaps, 1.5)  # 间隔最多 1.5s
+        else:
+            gap = 0.2  # 时间紧凑，最小间隔
+
+        offset = narration_start
         tts_parts = []
+        self.last_subtitle_timeline = []
 
         for sent_text, audio_path, audio_dur in sentence_audio:
             # 渲染字幕帧
@@ -427,12 +543,14 @@ class TweetVideoAgent:
                 .with_effects([vfx.FadeIn(0.15), vfx.FadeOut(0.15)])
             )
             subtitle_clips.append(sub_clip)
+            self.last_subtitle_timeline.append((sent_text, offset, audio_dur + 0.3))
 
-            # 配音 clip
-            tts_clip = AudioFileClip(audio_path).with_start(offset)
-            tts_parts.append(tts_clip)
+            # 配音 clip（静默字幕段跳过）
+            if audio_path is not None:
+                tts_clip = AudioFileClip(audio_path).with_start(offset)
+                tts_parts.append(tts_clip)
 
-            offset += audio_dur + 0.4  # 句间间隔0.4秒
+            offset += audio_dur + gap  # 自适应句间间隔
 
         # 5. 合成视频：背景 + 字幕叠加
         video = CompositeVideoClip(
@@ -449,7 +567,7 @@ class TweetVideoAgent:
             bgm_audio = bgm_raw.with_duration(actual_duration)
 
         if tts_parts:
-            bgm_quiet = bgm_audio.with_effects([afx.MultiplyVolume(0.08)])
+            bgm_quiet = bgm_audio.with_effects([afx.MultiplyVolume(0.18)])
             mixed = CompositeAudioClip([bgm_quiet] + tts_parts)
             mixed = mixed.with_duration(actual_duration)
             video = video.with_audio(mixed)
