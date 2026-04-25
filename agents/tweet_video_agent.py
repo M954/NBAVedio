@@ -28,6 +28,83 @@ WIDTH = 1080
 HEIGHT = 1920
 
 
+_VIDEO_CODEC_CACHE = None
+
+
+def _detect_video_codec():
+    """探测可用的视频编码器，优先 GPU。结果模块级缓存，只探一次。
+    返回 (codec, ffmpeg_params)。"""
+    global _VIDEO_CODEC_CACHE
+    if _VIDEO_CODEC_CACHE is not None:
+        return _VIDEO_CODEC_CACHE
+    import subprocess, tempfile, shutil, glob
+    ffmpeg_bin = None
+    # 优先用 winget 装的完整版 (含 nvenc/qsv/amf)
+    winget_glob = os.path.expandvars(
+        r"%LOCALAPPDATA%\Microsoft\WinGet\Packages\Gyan.FFmpeg*\ffmpeg-*-full_build\bin\ffmpeg.exe"
+    )
+    matches = glob.glob(winget_glob)
+    if matches:
+        ffmpeg_bin = matches[0]
+    if not ffmpeg_bin:
+        ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        try:
+            from imageio_ffmpeg import get_ffmpeg_exe
+            ffmpeg_bin = get_ffmpeg_exe()
+        except Exception:
+            ffmpeg_bin = "ffmpeg"
+    print(f"[Codec] 使用 ffmpeg: {ffmpeg_bin}")
+    candidates = [
+        ("h264_nvenc", ["-preset", "p4", "-tune", "hq", "-rc", "vbr", "-cq", "23"]),
+        ("h264_qsv",   ["-preset", "fast", "-global_quality", "23"]),
+        ("h264_amf",   ["-quality", "speed", "-rc", "vbr_quality", "-qp_i", "23"]),
+        ("libx264",    ["-preset", "veryfast", "-crf", "23"]),
+    ]
+    for codec, params in candidates:
+        try:
+            out = os.path.join(tempfile.gettempdir(), f"_codec_probe_{codec}.mp4")
+            cmd = [ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error",
+                   "-f", "lavfi", "-i", "color=c=black:s=320x240:d=0.5:r=24",
+                   "-c:v", codec, *params, out]
+            r = subprocess.run(cmd, capture_output=True, timeout=15)
+            if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
+                print(f"[Codec] 探测成功，使用 {codec}")
+                _VIDEO_CODEC_CACHE = (codec, params)
+                try: os.remove(out)
+                except Exception: pass
+                return _VIDEO_CODEC_CACHE
+            else:
+                err = (r.stderr or b"").decode(errors="ignore").strip().splitlines()[-1:] or [""]
+                print(f"[Codec] {codec} 不可用: {err[0]}")
+        except Exception as e:
+            print(f"[Codec] {codec} 探测异常: {e}")
+    _VIDEO_CODEC_CACHE = ("libx264", ["-preset", "veryfast", "-crf", "23"])
+    print(f"[Codec] 全部 GPU 编码器不可用，回落 libx264 veryfast")
+    return _VIDEO_CODEC_CACHE
+
+
+def _get_full_ffmpeg():
+    """返回完整版 ffmpeg 路径（含 nvenc/qsv），找不到则 None。供 MoviePy 切换用。"""
+    import glob, shutil
+    g = glob.glob(os.path.expandvars(
+        r"%LOCALAPPDATA%\Microsoft\WinGet\Packages\Gyan.FFmpeg*\ffmpeg-*-full_build\bin\ffmpeg.exe"
+    ))
+    if g:
+        return g[0]
+    sys_ff = shutil.which("ffmpeg")
+    if sys_ff:
+        return sys_ff
+    return None
+
+
+# 让 MoviePy/imageio_ffmpeg 用完整版 ffmpeg（支持 GPU 编码器）
+_full_ff = _get_full_ffmpeg()
+if _full_ff:
+    os.environ["IMAGEIO_FFMPEG_EXE"] = _full_ff
+    print(f"[Codec] MoviePy 切换到完整版 ffmpeg: {_full_ff}")
+
+
 def _get_font(size=36, bold=False):
     """加载中文字体"""
     paths = [
@@ -318,7 +395,8 @@ class TweetVideoAgent:
 
     def generate(self, images, translations, authors=None, mood="chill",
                  duration=12.0, output_name=None, commentary=None,
-                 song_query=None, source_video=None, video_subtitles=None):
+                 song_query=None, source_video=None, video_subtitles=None,
+                 highlight_segments=None):
         """
         生成推特短视频（逐句字幕版）
         
@@ -343,6 +421,14 @@ class TweetVideoAgent:
             authors = [""] * len(images)
         elif len(authors) < len(images):
             authors = authors + [""] * (len(images) - len(authors))
+
+        import time as _t
+        _t0 = _t.time()
+        _last = [_t0]
+        def _mark(label):
+            now = _t.time()
+            print(f"[Composer-计时] {label}: {now - _last[0]:.1f}s (累计 {now - _t0:.1f}s)")
+            _last[0] = now
 
         # 1. 构建字幕序列：解说词(有TTS) + 视频字幕(无TTS，静默展示)
         narration_texts = commentary if commentary else translations
@@ -403,8 +489,17 @@ class TweetVideoAgent:
                     from agents.ai_assistant import get_assistant
                     _ai = get_assistant()
                     shorter = _ai._call(
-                        f"请将以下解说词精简到{target_chars}字以内，保持原有风格和关键信息，"
-                        f"每句用句号结尾。\n\n原文：{full_text}"
+                        f"以下解说词的 TTS 朗读时长超过视频可承载长度，需要把它精简到 {target_chars} 字以内。\n\n"
+                        f"=== 原稿（基线，必须基于此压缩，不要重写）===\n{full_text}\n\n"
+                        f"压缩硬规则：\n"
+                        f"1. 【最小修改原则】只删冗余、合并啰嗦表达、砍可有可无的形容词/副词；"
+                        f"原稿里的开头钩子、关键事实、情绪结尾必须原样保留，不准重新创作。\n"
+                        f"2. 不要换说法、不要替换近义词、不要调整句序——能删就删，删不了就别动。\n"
+                        f"3. 完整性不能丢：开头-发展-结尾三段仍要齐全，结尾必须真的收住，不能砍成半截话。\n"
+                        f"4. 可读性不能降：每句仍要顺口、短句、TTS 念得通。\n"
+                        f"5. 标点保留：每短句以句号/感叹号/问号结尾。\n"
+                        f"6. 字数严格 ≤ {target_chars} 字。\n\n"
+                        f"只返回压缩后的解说词正文。"
                     )
                     if shorter and len(shorter.strip()) > 10:
                         full_text = shorter.strip().strip('"').strip("'")
@@ -426,6 +521,7 @@ class TweetVideoAgent:
                     print(f"  [Error] 重新生成失败: {e}")
                     break
 
+        _mark("步骤1 字幕序列+TTS")
         # 2. 获取背景音乐（AI选曲 → 搜索下载 → 合成）
         bgm_path = None
         _bgm_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "reference_videos", "bgm")
@@ -468,6 +564,7 @@ class TweetVideoAgent:
                 output_name=bgm_name,
             )
 
+        _mark("步骤2 BGM 获取")
         # 3. 生成背景
         frame_path = None
         INTRO_DUR = 5.0  # 截图开场时长（多停留让观众看清推文）
@@ -504,6 +601,7 @@ class TweetVideoAgent:
             bg_clip = ImageClip(frame_path).with_duration(actual_duration)
             bg_clip = bg_clip.with_effects([vfx.FadeIn(0.5), vfx.FadeOut(0.5)])
 
+        _mark("步骤3 背景生成")
         # 4. 构建逐句字幕（读一句展示一句，均匀分布在视频全程）
         subtitle_clips = []
         sub_bottom_margin = 120
@@ -552,12 +650,44 @@ class TweetVideoAgent:
 
             offset += audio_dur + gap  # 自适应句间间隔
 
+        _mark("步骤4 逐句字幕渲染")
+        # 4b. 高光段中译字幕（来自源视频原音翻译）
+        if highlight_segments and source_video and os.path.exists(source_video):
+            for h in highlight_segments:
+                _txt = (h.get("translation") or "").strip()
+                if not _txt:
+                    continue
+                _s = float(h.get("start", 0))
+                _e = float(h.get("end", 0))
+                _dur = _e - _s
+                if _dur <= 0:
+                    continue
+                _abs_start = INTRO_DUR + _s
+                if _abs_start >= actual_duration:
+                    continue
+                _dur = min(_dur, actual_duration - _abs_start)
+                _hl_img = self._render_subtitle_frame(_txt)
+                _hl_path = os.path.join(self.output_dir, f"hl_{uuid.uuid4().hex[:6]}.png")
+                _hl_img.save(_hl_path)
+                _hl_y = HEIGHT - _hl_img.size[1] - sub_bottom_margin
+                _hl_clip = (
+                    ImageClip(_hl_path)
+                    .with_duration(_dur)
+                    .with_position(("center", _hl_y))
+                    .with_start(_abs_start)
+                    .with_effects([vfx.FadeIn(0.15), vfx.FadeOut(0.15)])
+                )
+                subtitle_clips.append(_hl_clip)
+                self.last_subtitle_timeline.append((_txt, _abs_start, _dur))
+
+        _mark("步骤4b 高光字幕")
         # 5. 合成视频：背景 + 字幕叠加
         video = CompositeVideoClip(
             [bg_clip] + subtitle_clips,
             size=(WIDTH, HEIGHT),
         ).with_duration(actual_duration)
 
+        _mark("步骤5 视频合成 (CompositeVideoClip)")
         # 6. 混合音频：配音(前景) + BGM(背景)
         bgm_raw = AudioFileClip(bgm_path)
         if bgm_raw.duration < actual_duration:
@@ -568,24 +698,72 @@ class TweetVideoAgent:
 
         if tts_parts:
             bgm_quiet = bgm_audio.with_effects([afx.MultiplyVolume(0.18)])
-            mixed = CompositeAudioClip([bgm_quiet] + tts_parts)
+            audio_tracks = [bgm_quiet] + tts_parts
+        else:
+            audio_tracks = [bgm_audio]
+
+        _mark("步骤6 音频混合")
+        # 6b. 高光原音叠加（仅当源视频存在且有 highlight_segments）
+        highlight_audio_clips = []
+        _hl_src_holder = None  # 必须在渲染期间保持 reader 存活
+        if (highlight_segments and source_video
+                and os.path.exists(source_video)):
+            try:
+                from moviepy import VideoFileClip as _HVFC
+                _hl_src_holder = _HVFC(source_video)
+                if _hl_src_holder.audio:
+                    src_audio = _hl_src_holder.audio
+                    src_dur = src_audio.duration
+                    for h in highlight_segments:
+                        s = max(0.0, float(h.get("start", 0)))
+                        e = min(src_dur, float(h.get("end", 0)))
+                        if e <= s:
+                            continue
+                        abs_start = INTRO_DUR + s
+                        if abs_start >= actual_duration:
+                            continue
+                        seg = (src_audio.subclipped(s, e)
+                               .with_start(abs_start)
+                               .with_effects([afx.MultiplyVolume(0.95)]))
+                        highlight_audio_clips.append(seg)
+                    print(f"  [Highlight] 叠加 {len(highlight_audio_clips)} 段原音")
+                else:
+                    _hl_src_holder.close()
+                    _hl_src_holder = None
+            except Exception as _he:
+                print(f"  [Highlight] 原音叠加失败: {_he}")
+                if _hl_src_holder:
+                    try: _hl_src_holder.close()
+                    except Exception: pass
+                _hl_src_holder = None
+
+        if highlight_audio_clips:
+            audio_tracks.extend(highlight_audio_clips)
+
+        if len(audio_tracks) > 1 or highlight_audio_clips:
+            mixed = CompositeAudioClip(audio_tracks)
             mixed = mixed.with_duration(actual_duration)
             video = video.with_audio(mixed)
         else:
-            video = video.with_audio(bgm_audio)
+            video = video.with_audio(audio_tracks[0])
 
+        _mark("步骤6b 高光原音叠加")
         # 7. 渲染输出
         if not output_name:
             output_name = f"tweet_{uuid.uuid4().hex[:8]}.mp4"
         output_path = os.path.join(self.output_dir, output_name)
 
+        _codec, _ffmpeg_params = _detect_video_codec()
         video.write_videofile(
             output_path,
             fps=24,
-            codec="libx264",
+            codec=_codec,
             audio_codec="aac",
+            ffmpeg_params=_ffmpeg_params,
+            threads=os.cpu_count() or 4,
             logger=None,
         )
+        _mark(f"步骤7 写盘 (write_videofile, codec={_codec})")
 
         # 清理临时文件
         if frame_path and os.path.exists(frame_path):

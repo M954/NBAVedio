@@ -15,6 +15,10 @@ import uuid
 import shutil
 import time
 import threading
+import asyncio
+import concurrent.futures
+import multiprocessing
+from contextlib import asynccontextmanager
 from collections import deque
 from typing import Optional
 from dotenv import load_dotenv
@@ -24,10 +28,66 @@ from fastapi.responses import FileResponse, JSONResponse
 from agents.tweet_video_agent import TweetVideoAgent
 from agents.ai_assistant import get_assistant
 
+_executor: concurrent.futures.ProcessPoolExecutor | None = None
+_log_manager: "multiprocessing.managers.SyncManager | None" = None
+_log_queue = None
+_log_reader_thread: threading.Thread | None = None
+_log_reader_stop = threading.Event()
+
+
+def _drain_log_queue():
+    while not _log_reader_stop.is_set():
+        try:
+            item = _log_queue.get(timeout=0.5)
+        except Exception:
+            continue
+        if item is None:
+            break
+        msg, level = item
+        _vlog(msg, level)
+
+
+def _kill_executor_children():
+    if _executor is None:
+        return
+    for p in list(getattr(_executor, "_processes", {}).values()):
+        try:
+            p.terminate()
+        except Exception:
+            pass
+
+
+@asynccontextmanager
+async def lifespan(app):
+    global _executor, _log_queue, _log_manager, _log_reader_thread
+    ctx = multiprocessing.get_context("spawn")
+    _log_manager = ctx.Manager()
+    _log_queue = _log_manager.Queue()
+    _executor = concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=ctx)
+    _log_reader_stop.clear()
+    _log_reader_thread = threading.Thread(target=_drain_log_queue, daemon=True)
+    _log_reader_thread.start()
+    try:
+        yield
+    finally:
+        _kill_executor_children()
+        _executor.shutdown(wait=False, cancel_futures=True)
+        _log_reader_stop.set()
+        try:
+            _log_queue.put_nowait(None)
+        except Exception:
+            pass
+        try:
+            _log_manager.shutdown()
+        except Exception:
+            pass
+
+
 app = FastAPI(
     title="NBA Tweet Video Generator API",
     description="将球星推特截图 + 中文翻译合成竖屏短视频（含AI增强+配音配乐）",
     version="3.0.0",
+    lifespan=lifespan,
 )
 
 # 上传临时目录
@@ -128,13 +188,23 @@ def get_logs(limit: int = 200):
 
 @app.post("/cancel")
 def cancel_generation():
-    """取消当前正在进行的视频生成。"""
-    global _active_request_id
-    if _active_request_id:
-        _cancel_flags[_active_request_id] = True
-        _vlog(f"[cancel] 收到取消请求，正在停止 {_active_request_id}...", "warn")
-        return {"status": "cancelling", "request_id": _active_request_id}
-    return {"status": "no_active_task"}
+    """取消当前正在进行的视频生成（强杀子进程）。"""
+    global _executor, _active_request_id
+    if not _active_request_id:
+        return {"status": "no_active_task"}
+    rid = _active_request_id
+    _cancel_flags[rid] = True
+    _vlog(f"[cancel] 强杀子进程，停止 {rid}", "warn")
+    _kill_executor_children()
+    # 重建 executor，否则下一次请求会失败
+    ctx = multiprocessing.get_context("spawn")
+    try:
+        _executor.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
+    _executor = concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=ctx)
+    _active_request_id = ""
+    return {"status": "cancelled", "request_id": rid}
 
 
 @app.get("/status")
@@ -146,39 +216,29 @@ def get_status():
     }
 
 
-def _cleanup_intermediates(request_id, output_dir, audio_dir):
-    """清理视频生成的中间产物：迭代版本、TTS音频、合成BGM、临时帧。"""
+def _cleanup_intermediates(output_dir, audio_dir):
+    """清理历史所有中间产物。在每次新生成开始时调用。
+    保留：最终成片（无 _v 后缀的 tweet_*.mp4）、reference_videos、
+    audio_dir 下非 tts_/bgm_ 前缀的文件。"""
     import glob
     cleaned = 0
-    # 删除迭代版本 tweet_{id}_v1.mp4 等
-    for f in glob.glob(os.path.join(output_dir, f"tweet_{request_id}_v*.mp4")):
-        try:
-            os.remove(f)
-            cleaned += 1
-        except Exception:
-            pass
-    # 删除 TTS 和合成 BGM（audio 目录下的临时文件）
-    for pattern in ["tts_*.mp3", "tts_*.wav", "bgm_*.wav"]:
-        for f in glob.glob(os.path.join(audio_dir, pattern)):
+    patterns = [
+        os.path.join(output_dir, "tweet_*_v*.mp4"),       # 迭代版本
+        os.path.join(output_dir, "frame_*.png"),          # 临时帧
+        os.path.join(output_dir, "sub_*.png"),            # TTS 字幕帧
+        os.path.join(output_dir, "hl_*.png"),             # 高光字幕帧
+        os.path.join(audio_dir, "tts_*.mp3"),
+        os.path.join(audio_dir, "tts_*.wav"),
+        os.path.join(audio_dir, "bgm_*.wav"),
+    ]
+    for pat in patterns:
+        for f in glob.glob(pat):
             try:
                 os.remove(f)
                 cleaned += 1
             except Exception:
                 pass
-    # 删除临时帧
-    for f in glob.glob(os.path.join(output_dir, "frame_*.png")):
-        try:
-            os.remove(f)
-            cleaned += 1
-        except Exception:
-            pass
-    for f in glob.glob(os.path.join(output_dir, "sub_*.png")):
-        try:
-            os.remove(f)
-            cleaned += 1
-        except Exception:
-            pass
-    # 清理 uploads
+    # 清空 uploads
     uploads_dir = os.path.join(output_dir, "uploads")
     if os.path.isdir(uploads_dir):
         for f in os.listdir(uploads_dir):
@@ -190,7 +250,7 @@ def _cleanup_intermediates(request_id, output_dir, audio_dir):
                 except Exception:
                     pass
     if cleaned:
-        _vlog(f"[cleanup] 已清理 {cleaned} 个中间文件")
+        _vlog(f"[cleanup] 已清理 {cleaned} 个历史中间文件")
 
 
 @app.get("/health")
@@ -402,6 +462,7 @@ async def generate_video_ai(
     duration: Optional[float] = Form(12.0, description="视频时长（秒）"),
     max_rounds: Optional[int] = Form(3, description="最大迭代轮数（1-3）"),
     backend: Optional[str] = Form(None, description="AI后端: claude/gpt（默认读 AI_BACKEND 环境变量）"),
+    highlight: Optional[str] = Form(None, description="是否对原视频识别高光段并保留原音 (1/true/yes 启用)"),
     video: Optional[UploadFile] = File(None, description="推文自带视频文件（可选）"),
 ):
     """
@@ -436,6 +497,11 @@ async def generate_video_ai(
     saved_video_path = None
     request_id = uuid.uuid4().hex[:8]
     try:
+        # 在保存新一轮 uploads 之前，先清理历史所有中间产物
+        _output_dir = os.path.dirname(UPLOAD_DIR)
+        _audio_dir = os.path.join(_output_dir, "audio")
+        _cleanup_intermediates(_output_dir, _audio_dir)
+
         for i, img_file in enumerate(images):
             ext = os.path.splitext(img_file.filename or "img.jpg")[1] or ".jpg"
             if ext.lower() not in (".jpg", ".jpeg", ".png", ".webp"):
@@ -456,15 +522,19 @@ async def generate_video_ai(
             saved_video_path = video_save
             _vlog(f"[generate-ai] 收到推文视频: {video.filename}")
 
-        # 把重活放到线程池，不阻塞 uvicorn event loop（health/logs 可正常响应）
-        import asyncio
+        # 把重活放到独立子进程，Ctrl+C / /cancel 可以直接 terminate
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            _do_generate_ai,
-            saved_paths, saved_video_path, trans_list, author_list, orig_list,
-            duration, max_rounds, ai, request_id,
-        )
+        _active_request_id_set(request_id)
+        _highlight_flag = str(highlight or "").lower() in ("1", "true", "yes", "on")
+        try:
+            result = await loop.run_in_executor(
+                _executor,
+                _do_generate_ai_subprocess,
+                saved_paths, saved_video_path, trans_list, author_list, orig_list,
+                duration, max_rounds, backend, request_id, _log_queue, _highlight_flag,
+            )
+        finally:
+            _active_request_id_clear(request_id)
         return JSONResponse(content=result)
 
     except Exception as e:
@@ -472,17 +542,42 @@ async def generate_video_ai(
         raise HTTPException(status_code=500, detail=f"视频生成失败: {str(e)}")
 
 
+def _active_request_id_set(rid: str):
+    global _active_request_id
+    _active_request_id = rid
+
+
+def _active_request_id_clear(rid: str):
+    global _active_request_id, _last_request_id
+    if _active_request_id == rid:
+        _active_request_id = ""
+    _cancel_flags.pop(rid, None)
+    _last_request_id = rid
+
+
+def _do_generate_ai_subprocess(saved_paths, saved_video_path, trans_list, author_list, orig_list,
+                                duration, max_rounds, backend, request_id, log_queue,
+                                highlight=False):
+    """子进程入口：重新构造 ai/logger，调用原同步流程。"""
+    def _qlog(msg, level="info"):
+        try:
+            log_queue.put_nowait((str(msg), level))
+        except Exception:
+            pass
+
+    from agents.ai_assistant import get_assistant as _get
+    ai = _get(backend, logger=_qlog)
+    return _do_generate_ai_inner(saved_paths, saved_video_path, trans_list,
+                                  author_list, orig_list, duration, max_rounds,
+                                  ai, request_id, logger=_qlog, highlight=highlight)
+
+
 def _do_generate_ai(saved_paths, saved_video_path, trans_list, author_list, orig_list,
                     duration, max_rounds, ai, request_id):
-    """同步执行视频生成全流程（在线程池中运行）。"""
+    """同步执行视频生成全流程（兼容旧调用）。"""
     global _active_request_id
     global _active_request_id, _last_request_id
     _active_request_id = request_id
-
-    # 清理上一次生成的中间产物（当前轮保留用于分析）
-    if _last_request_id:
-        _vlog(f"[cleanup] 清理上一轮 ({_last_request_id}) 的中间产物")
-        _cleanup_intermediates(_last_request_id, agent.output_dir, agent.audio_dir)
 
     result = None
     try:
@@ -491,12 +586,13 @@ def _do_generate_ai(saved_paths, saved_video_path, trans_list, author_list, orig
     finally:
         _active_request_id = ""
         _cancel_flags.pop(request_id, None)
-        _last_request_id = request_id  # 记录当前 request_id，下次生成时清理
+        _last_request_id = request_id
     return result
 
 
 def _do_generate_ai_inner(saved_paths, saved_video_path, trans_list, author_list, orig_list,
-                          duration, max_rounds, ai, request_id):
+                          duration, max_rounds, ai, request_id, logger=None, highlight=False):
+    _vlog = logger or globals()["_vlog"]
     orig0 = orig_list[0] if orig_list else ""
     author0 = author_list[0] if author_list else ""
     import time as _t
@@ -512,7 +608,7 @@ def _do_generate_ai_inner(saved_paths, saved_video_path, trans_list, author_list
         try:
             result = ai.polish_translation(orig, trans)
             polished.append(result)
-            _vlog(f"  翻译优化: {trans[:30]}... → {result[:30]}...")
+            _vlog(f"  翻译优化: {trans} → {result}")
         except Exception as e:
             polished.append(trans)
             _vlog(f"  翻译优化失败: {e}", "warn")
@@ -526,7 +622,6 @@ def _do_generate_ai_inner(saved_paths, saved_video_path, trans_list, author_list
         _vlog("[generate-ai] 步骤2: 分析推文视频内容")
         try:
             video_description = ai.analyze_video_content(saved_video_path, orig0, author0)
-            _vlog(f"[generate-ai] 视频内容: {video_description[:100]}...")
         except Exception as e:
             _vlog(f"[generate-ai] 视频分析失败: {e}", "warn")
         # 提取视频中的对话/旁白翻译为字幕
@@ -564,7 +659,7 @@ def _do_generate_ai_inner(saved_paths, saved_video_path, trans_list, author_list
                                        video_description=video_description,
                                        target_duration=target_video_duration)
             commentaries.append(c)
-            _vlog(f"  解说词: {c[:80]}...")
+            _vlog(f"  解说词: {c}")
         except Exception as e:
             commentaries.append(trans)
             _vlog(f"  解说词生成失败: {e}", "warn")
@@ -586,6 +681,24 @@ def _do_generate_ai_inner(saved_paths, saved_video_path, trans_list, author_list
     except Exception:
         mood = "chill"
     _vlog(f"[generate-ai] 步骤4完成，耗时 {_t.time()-_step_t:.1f}s")
+
+    # 4b. 识别原视频高光段（仅在用户请求时启用）
+    highlight_segments = []
+    if highlight and saved_video_path and os.path.exists(saved_video_path):
+        _hl_t = _t.time()
+        _vlog("[generate-ai] 步骤4b: Gemini 识别原视频高光段")
+        try:
+            highlight_segments = ai.pick_highlight_segments_gemini(saved_video_path)
+            for _h in highlight_segments:
+                _vlog(f"  高光 [{_h['start']:.1f}-{_h['end']:.1f}s] "
+                      f"原: {_h.get('original') or ''} | 译: {_h['translation']}")
+            if not highlight_segments:
+                _vlog("  Gemini 未挑出高光段")
+        except Exception as _he:
+            _vlog(f"  高光识别失败: {_he}", "warn")
+        _vlog(f"[generate-ai] 步骤4b完成，耗时 {_t.time()-_hl_t:.1f}s")
+    elif saved_video_path:
+        _vlog("[generate-ai] 步骤4b跳过 (highlight=off)")
 
     # 5-8. 迭代生成 + 审阅
     _vlog(f"[generate-ai] 步骤5-8: 开始迭代生成 (最多{max_rounds}轮)")
@@ -616,6 +729,7 @@ def _do_generate_ai_inner(saved_paths, saved_video_path, trans_list, author_list
             song_query=cur_song,
             source_video=saved_video_path,
             video_subtitles=video_subtitles,
+            highlight_segments=highlight_segments,
         )
         _vlog(f"  视频生成耗时: {_t.time()-_gen_t:.1f}s")
 
@@ -694,31 +808,65 @@ def _do_generate_ai_inner(saved_paths, saved_video_path, trans_list, author_list
 
         if rnd < max_rounds:
             _vlog(f"[generate-ai] 第{rnd}轮未达标 (耗时 {_t.time()-_rnd_t:.1f}s)，准备改进...")
-            # 把 review 建议传给解说词重写
-            suggestion_hint = "；".join(suggestions) if suggestions else ""
+            # 把 review 完整反馈传给解说词重写
+            _content_issues = review.get("content_issues", []) or []
+            _sub_mismatches = review.get("subtitle_mismatches", []) or []
+            _suggestions = suggestions or []
+            _details = review.get("details", {}) or {}
+
+            # 计算目标字数（与初版 prompt 保持一致：4字/秒，预留首尾 3s）
+            _avail = max(target_video_duration - 3, 8)
+            _tgt_chars = int(_avail * 4)
+            _min_chars = max(_tgt_chars - 20, 60)
+            _max_chars = _tgt_chars + 20
+
+            try:
+                from agents.style_guide import PLAYER_NICKNAMES as _PN, FORBIDDEN_WORDS as _FW
+                _nick_table = "\n".join(f"  {e} = {c}" for e, c in _PN.items() if c)
+                _forbid = "、".join(_FW)
+            except Exception:
+                _nick_table = ""
+                _forbid = ""
+
             try:
                 rewrite_prompt = (
-                    f"请根据以下审阅反馈重写解说词。\n\n"
-                    f"当前解说词: {cur_commentary}\n"
-                    f"审阅建议: {suggestion_hint}\n\n"
-                    f"推文原文: {orig0}\n"
-                    f"翻译: {polished[0] if polished else ''}\n"
+                    f"你是篮球邮差Melo风格NBA短视频博主。上一版解说词被审阅 agent 扣分了，"
+                    f"请根据反馈彻底修复所有被点名的问题，写出一版高质量的新解说词。\n\n"
+                    f"=== 审阅反馈（这是本次重写的核心依据，每一条都必须修）===\n"
+                    f"评分明细: {_details}\n"
+                    f"内容事实问题: {_content_issues if _content_issues else '无'}\n"
+                    f"字幕/画面错位: {_sub_mismatches if _sub_mismatches else '无'}\n"
+                    f"改进建议: {_suggestions if _suggestions else '无'}\n\n"
+                    f"=== 上一版解说词（仅供参考，可大改可重写，目标是修掉上面所有问题）===\n{cur_commentary}\n\n"
+                    f"=== 推文上下文 ===\n"
                     f"作者: {author0}\n"
+                    f"原文: {orig0}\n"
+                    f"翻译: {polished[0] if polished else ''}\n"
                 )
                 if video_description:
                     rewrite_prompt += f"视频内容: {video_description}\n"
                 rewrite_prompt += (
-                    f"\n重写要求：\n"
-                    f"1. 必须忠实于推文原文的事实，不能添油加醋或编造细节\n"
-                    f"2. 如果有视频，解说词必须与视频内容一致\n"
-                    f"3. 针对审阅建议中指出的问题进行修正\n"
-                    f"4. 保持篮球邮差Melo的口语风格\n"
-                    f"80-150字，只返回解说词。"
+                    f"\n=== 重写硬规则 ===\n"
+                    f"⚠️ 解说词是整个视频的灵魂，必须同时满足【完整】+【顺畅可读】：\n"
+                    f"  - 完整：开头-发展-结尾三段齐全，核心事实交代完，结尾真的收住，不能戛然而止\n"
+                    f"  - 可读：念出来自然顺口，短句优先(8-20字)，禁止翻译腔/堆砌定语，朗读不卡壳\n\n"
+                    f"1. 【绝对优先】审阅反馈里的每一条事实错误、字幕错位、改进建议都必须修掉，不能漏\n"
+                    f"2. 必须忠实于推文原文事实；不能添油加醋、张冠李戴、编造细节\n"
+                    f"3. 如果有视频，解说词必须与视频画面/对白一致，不得描述画面里没有的东西\n"
+                    f"4. 字数严格在 {_min_chars}-{_max_chars} 字之间（视频 {target_video_duration:.0f}s，超长会被截）\n"
+                    f"5. 开头第一句必须是'XXX今日发推/转推'+情绪钩子；结尾必须收住（个人观点/反问/价值判断）\n"
+                    f"6. 必须使用口语词：真的、太、算是、天啊、好家伙、没得说、直接、拉满\n"
+                    f"7. 绝对禁用书面套话：{_forbid}\n"
+                    f"8. 标点：每短句以句号/感叹号/问号结尾，句内停顿用逗号，禁止用空格代替标点\n"
+                    f"9. 球员译名严格使用下表，禁止生造：\n{_nick_table}\n"
+                    f"   表外球员用国内主流篮球媒体通用音译，不确定就用全名音译\n\n"
+                    f"只返回修订后的解说词正文，不要前言、不要diff、不要解释。提交前对照审阅反馈逐条核对，"
+                    f"确认【所有反馈都修了 + 完整 + 顺口 + 字数达标】才提交。"
                 )
                 improved = ai._call(rewrite_prompt)
                 if improved and len(improved.strip()) > 10:
                     cur_commentary = improved.strip().strip('"').strip("'")
-                    _vlog(f"  解说词已重写: {cur_commentary[:50]}...")
+                    _vlog(f"  解说词已重写: {cur_commentary}")
             except Exception as e:
                 _vlog(f"  解说词重写失败: {e}", "warn")
 
@@ -771,5 +919,26 @@ def _do_generate_ai_inner(saved_paths, saved_video_path, trans_list, author_list
 
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import uvicorn, signal, logging
+
+    class _SilenceHealth(logging.Filter):
+        def filter(self, record):
+            msg = record.getMessage()
+            return "/health" not in msg
+
+    logging.getLogger("uvicorn.access").addFilter(_SilenceHealth())
+
+    config = uvicorn.Config(app, host="0.0.0.0", port=8000)
+    server = uvicorn.Server(config)
+
+    def _force_exit(*_):
+        _kill_executor_children()
+        server.should_exit = True
+        server.force_exit = True
+
+    signal.signal(signal.SIGINT, _force_exit)
+    try:
+        signal.signal(signal.SIGTERM, _force_exit)
+    except Exception:
+        pass
+    server.run()
