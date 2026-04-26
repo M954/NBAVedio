@@ -2,6 +2,8 @@
 import asyncio
 import os
 import re
+import shutil
+import subprocess
 import time
 import wave
 import edge_tts
@@ -56,7 +58,10 @@ class VoiceActor:
 
     @staticmethod
     def _sanitize_for_tts(text):
-        """清理文本，移除 edge-tts 不支持的字符和格式"""
+        """清理文本，移除 edge-tts 不支持的字符和格式。同时压短句间停顿：
+        - 句末 `。` 替换为 `，` 让 TTS 用短停顿
+        - 连续逗号去重避免叠加停顿
+        """
         # 移除 emoji（补充平面字符）
         text = re.sub(r'[\U00010000-\U0010ffff]', '', text)
         # 替换可能导致 edge-tts 失败的标点
@@ -64,11 +69,49 @@ class VoiceActor:
         text = text.replace('"', '').replace("'", '').replace("'", '').replace("'", '')
         text = text.replace('【', '').replace('】', '').replace('《', '').replace('》', '')
         text = text.replace('！', '。').replace('？', '。')
+        # 压短句间停顿：句号当短停顿处理
+        text = text.replace('。', '，')
         # 移除 @ 和 # 标签
         text = re.sub(r'[@#]\S+', '', text)
-        # 移除连续空白
+        # 合并连续逗号/空白
+        text = re.sub(r'[，,]\s*[，,]+', '，', text)
         text = re.sub(r'\s+', ' ', text).strip()
+        # 去掉首尾多余逗号
+        text = text.strip('，,')
         return text
+
+    @staticmethod
+    def _trim_silences(path, max_silence_ms=200, silence_thresh_db=-35):
+        """用 ffmpeg silenceremove 把所有 >max_silence_ms 的静音段压到 max_silence_ms。"""
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            return
+        if not os.path.exists(path) or os.path.getsize(path) < 1000:
+            return
+        tmp_path = path + ".trim.mp3"
+        stop_dur = max_silence_ms / 1000.0
+        # silenceremove: 检测 stop_duration 以上的静音段，压到 stop_duration
+        # stop_periods=-1 处理所有段；stop_silence 让保留段长度=stop_duration
+        af = (
+            f"silenceremove=stop_periods=-1:stop_duration={stop_dur}:"
+            f"stop_threshold={silence_thresh_db}dB:stop_silence={stop_dur}"
+        )
+        try:
+            result = subprocess.run(
+                [ffmpeg, "-y", "-i", path, "-af", af, "-c:a", "libmp3lame", "-q:a", "4", tmp_path],
+                capture_output=True, timeout=30,
+            )
+            if result.returncode == 0 and os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 1000:
+                os.replace(tmp_path, path)
+            else:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+        except Exception:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
 
     async def _synthesize(self, text, output_path, rate="+0%", volume="+0%", pitch="+0Hz"):
         # 首次成功后锁定 voice，保证整条视频音色一致
@@ -149,6 +192,7 @@ class VoiceActor:
                     clean_text, output_path, rate=rate, volume=volume, pitch=pitch
                 ))
                 if self._validate_mp3(output_path):
+                    self._trim_silences(output_path)
                     return output_path
                 else:
                     print(f"  [VoiceActor] 音频验证失败，重试中...")
