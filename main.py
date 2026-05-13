@@ -6,6 +6,9 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from utils.console_encoding import ensure_utf8_console
+ensure_utf8_console()
+
 from agents.producer import Producer
 from agents.script_writer import ScriptWriter
 from agents.visual_designer import VisualDesigner

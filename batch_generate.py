@@ -2,6 +2,10 @@
 import json
 import os
 import sys
+
+from utils.console_encoding import ensure_utf8_console
+ensure_utf8_console()
+
 from agents.ai_assistant import AIAssistant
 from agents.tweet_video_agent import TweetVideoAgent
 

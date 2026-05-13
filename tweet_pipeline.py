@@ -3,6 +3,9 @@
 """
 import os
 
+from utils.console_encoding import ensure_utf8_console
+ensure_utf8_console()
+
 
 def generate_tweet_video(
     images,

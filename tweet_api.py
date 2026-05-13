@@ -18,6 +18,9 @@ import threading
 import asyncio
 import concurrent.futures
 import multiprocessing
+
+from utils.console_encoding import ensure_utf8_console
+ensure_utf8_console()
 from contextlib import asynccontextmanager
 from collections import deque
 from typing import Optional
