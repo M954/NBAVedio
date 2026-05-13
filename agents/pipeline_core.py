@@ -425,7 +425,7 @@ def run_pipeline(
             try:
                 from agents.research_agent import ResearchAgent, usage_this_month
 
-                _researcher = ResearchAgent()
+                _researcher = ResearchAgent(ai=ai)
                 _used, _quota = usage_this_month()
                 log(
                     f"  [Research] 触发检索 (本月已用 {_used}/{_quota}); query={refined_q!r}"
