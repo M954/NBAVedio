@@ -6,7 +6,14 @@ import shutil
 import subprocess
 import time
 import wave
+import httpx
 import edge_tts
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 # Edge TTS 需要通过代理访问 speech.platform.bing.com
 # 自动从系统代理设置中读取，设置到环境变量供 aiohttp 使用
@@ -33,8 +40,12 @@ class VoiceActor:
         os.makedirs(output_dir, exist_ok=True)
 
     def _get_voice_candidates(self):
-        """返回可选 voice，固定使用 YunxiNeural（最接近参考视频风格）。"""
-        return [self.voice]
+        """主声 + 备用声，避免单一 voice 被 Bing 端点 403 时全军覆没。"""
+        candidates = [self.voice]
+        for v in ("zh-CN-YunjianNeural", "zh-CN-YunyangNeural", "zh-CN-XiaoxiaoNeural"):
+            if v not in candidates:
+                candidates.append(v)
+        return candidates
 
     def _get_loop(self):
         """获取或创建一个可复用的事件循环，避免反复 asyncio.run() 导致冲突"""
@@ -113,11 +124,50 @@ class VoiceActor:
                 except Exception:
                     pass
 
+    async def _synthesize_azure(self, text, output_path, voice):
+        """Azure Speech REST 后端：用 API key + SSML 走 HTTPS，绕开 Bing WebSocket 403。"""
+        key = os.environ.get("AZURE_SPEECH_KEY", "")
+        region = os.environ.get("AZURE_SPEECH_REGION", "")
+        if not key or not region:
+            raise RuntimeError("azure_speech_not_configured")
+        lang = "-".join(voice.split("-")[:2])
+        ssml = (
+            f"<speak version='1.0' xml:lang='{lang}'>"
+            f"<voice name='{voice}'>{text}</voice></speak>"
+        )
+        url = f"https://{region}.tts.speech.microsoft.com/cognitiveservices/v1"
+        headers = {
+            "Ocp-Apim-Subscription-Key": key,
+            "Content-Type": "application/ssml+xml",
+            "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
+            "User-Agent": "NBAVedio",
+        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            async with client.stream("POST", url, headers=headers, content=ssml.encode("utf-8")) as resp:
+                if resp.status_code != 200:
+                    body = (await resp.aread())[:200]
+                    raise RuntimeError(f"azure_tts_http_{resp.status_code}: {body!r}")
+                with open(output_path, "wb") as f:
+                    async for chunk in resp.aiter_bytes(chunk_size=4096):
+                        if chunk:
+                            f.write(chunk)
+
     async def _synthesize(self, text, output_path, rate="+0%", volume="+0%", pitch="+0Hz"):
         # 首次成功后锁定 voice，保证整条视频音色一致
         voices = [self._resolved_voice] if self._resolved_voice else self._get_voice_candidates()
+        azure_configured = bool(os.environ.get("AZURE_SPEECH_KEY") and os.environ.get("AZURE_SPEECH_REGION"))
         last_error = None
         for voice in voices:
+            # 1) Azure 优先（如果配置了）
+            if azure_configured:
+                try:
+                    await self._synthesize_azure(text, output_path, voice)
+                    self._resolved_voice = voice
+                    return voice
+                except Exception as exc:
+                    last_error = exc
+                    # Azure 不可恢复（如 401/403/未配置），不再对该 voice 重试，直接尝试 edge-tts
+            # 2) edge-tts 兜底
             try:
                 communicate = edge_tts.Communicate(
                     text, voice, rate=rate, volume=volume, pitch=pitch,

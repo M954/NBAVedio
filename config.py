@@ -49,6 +49,11 @@ TTS_RATE = "+0%"                        # 语速调整
 TTS_VOLUME = "+0%"                      # 音量调整
 TTS_PITCH = "+0Hz"                      # 音调调整
 
+# === Azure Speech TTS（首选后端，避开 edge-tts WebSocket 403）===
+# 同时设置以下两个环境变量即可启用 Azure；未设置则自动回退到 edge-tts
+AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY", "")
+AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION", "")
+
 # === 视频画面时间配置 (秒) ===
 INTRO_DURATION = 2.0        # 开场动画时长
 TITLE_DISPLAY_TIME = 1.5    # 标题额外显示时间（在语音之外）

@@ -1,9 +1,10 @@
 """推特短视频生成主流程 - AI 增强版 v2
-集成: AI解说词 + 真实歌曲配乐 + TTS配音 + 迭代审阅
+集成: 全网背景检索 + AI解说词 + 真实歌曲配乐 + TTS配音 + 迭代审阅
 """
 import os
 from agents.ai_assistant import AIAssistant
 from agents.tweet_video_agent import TweetVideoAgent
+from agents.research_agent import ResearchAgent
 from moviepy import VideoFileClip
 
 
@@ -15,9 +16,11 @@ def generate_tweet_video(
     duration=12.0,
     max_rounds=3,
     target_grade="A",
+    tweet_ids=None,
 ):
     ai = AIAssistant()
     agent = TweetVideoAgent()
+    researcher = ResearchAgent()
 
     print("=" * 50)
     print("  🐦 推特短视频 AI 生成 v2")
@@ -39,9 +42,31 @@ def generate_tweet_video(
 
     # --- Step 2: AI 生成解说词（配音用，有解说感） ---
     print("\n>>> [2/5] AI 生成解说词...")
+    tweet_id0 = tweet_ids[0] if tweet_ids else ""
+    context_brief = ""
+    if tweet_id0:
+        # 先让 LLM 判断推文是否需要外部背景，省 SerpAPI 月度额度
+        try:
+            need, refined_query = ai.needs_research(orig0, polished[0], author0)
+        except Exception:
+            need, refined_query = False, ""
+        if not need:
+            print("  背景: 跳过（推文自身可理解）")
+        else:
+            try:
+                research = researcher.research(tweet_id0, orig0, author0, query_override=refined_query)
+                context_brief = research.get("context_brief", "")
+                if context_brief:
+                    head = context_brief[:120].replace("\n", " ")
+                    print(f"  背景({len(context_brief)}字): {head}...")
+                else:
+                    err = research.get("error", "")
+                    print(f"  背景: 无{(' / '+err) if err else ''}")
+            except Exception as exc:
+                print(f"  背景检索失败: {exc}")
     commentary = None
     try:
-        commentary = ai.generate_commentary(orig0, polished[0], author0)
+        commentary = ai.generate_commentary(orig0, polished[0], author0, context_brief=context_brief)
     except Exception:
         commentary = polished[0]
     print(f"  解说: {commentary}")

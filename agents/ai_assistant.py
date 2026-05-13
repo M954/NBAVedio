@@ -571,7 +571,7 @@ class _BaseAssistant:
             self._log(f"视频分析: GPT-4o fallback 也失败: {e}", "error")
             return ""
 
-    def generate_commentary(self, original_text, translation, author="", has_video=False, video_description="", target_duration=0):
+    def generate_commentary(self, original_text, translation, author="", has_video=False, video_description="", target_duration=0, context_brief=""):
         """生成解说词（不是简单翻译，而是有解说感的旁白）"""
         try:
             from .style_guide import STYLE_EXAMPLES, COMMENTARY_RULES, PLAYER_NICKNAMES, FORBIDDEN_WORDS
@@ -648,6 +648,11 @@ class _BaseAssistant:
             f"球星: {author}{nickname_hint}\n"
             f"原文: {original_text}\n"
             f"翻译: {translation}\n\n"
+            + (
+                "【背景资料（来自全网搜索，仅用于让你理解推文背景；禁止照搬、禁止逐条朗读、禁止编造资料里没有的内容）】\n"
+                f"{context_brief}\n\n"
+                if context_brief else ""
+            ) +
             f"再次提醒：返回前在心里默念一遍解说词，确认【完整、顺口、能让人听懂】才提交。"
         )
         result = self._call(prompt)
@@ -660,6 +665,42 @@ class _BaseAssistant:
             text = re.sub(r'([\u4e00-\u9fff])\s+([\u4e00-\u9fff])', r'\1，\2', text)
             return text
         return translation
+
+    def needs_research(self, original_text, translation, author="", video_description=""):
+        """LLM 判断推文是否需要外部检索补充背景。
+        返回 (need: bool, query: str)。query 为空时调用方用默认 query。
+        失败时保守返回 (False, '') —— 省搜索额度。
+
+        video_description: 已分析的推文自带视频内容描述（如有）。文字+视频合起来
+        仍模糊才需要搜；纯文字模糊但视频已经把事讲清的情况判 False。
+        """
+        video_block = ""
+        if video_description:
+            video_block = (
+                "推文带视频，下面是视频内容分析（如果视频已经把事件/人物讲清楚，"
+                "不需要再搜索）：\n"
+                f"{_truncate(video_description, 800)}\n\n"
+            )
+        prompt = (
+            "你在判断一条NBA推文是否需要去全网搜索背景，才能写出准确的中文解说词。\n"
+            "判断依据是【文字 + 视频内容】合起来够不够：\n"
+            "- 文字+视频已经把人物+事件+情绪交代清楚 → 不需要搜索\n"
+            "- 文字很短或模糊（如 'RIP B CLARKE'、'😂😂'、'INSANE'），且视频也无法独立解释事件 → 需要搜索\n"
+            "- 暗示外部事件（爆料、伤情、签约、纪念、内涵球员/事件）但当前材料不足 → 需要搜索\n\n"
+            "严格只返回一行 JSON，格式：{\"need\": true|false, \"query\": \"英文搜索词，可空\"}\n"
+            "不要解释、不要多余文字。\n\n"
+            f"作者: {author}\n原文: {original_text}\n翻译: {translation}\n"
+            f"{video_block}"
+        )
+        try:
+            raw = self._call(prompt) or ""
+            m = re.search(r"\{.*\}", raw, re.S)
+            if not m:
+                return False, ""
+            data = json.loads(m.group(0))
+            return bool(data.get("need")), str(data.get("query") or "").strip()
+        except Exception:
+            return False, ""
 
     def recommend_music_claude(self, blog_content, author=""):
         """推荐最适合的配乐歌曲（英文 prompt，更适合音乐推荐）"""

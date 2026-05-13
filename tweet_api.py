@@ -128,7 +128,11 @@ def _vlog(msg, level="info"):
     with _logs_lock:
         _logs.append(entry)
     line = f"[{ts}] [{level}] {msg}\n"
-    _orig_stdout.write(line)
+    try:
+        _orig_stdout.write(line)
+    except UnicodeEncodeError:
+        enc = getattr(_orig_stdout, "encoding", "utf-8") or "utf-8"
+        _orig_stdout.write(line.encode(enc, errors="replace").decode(enc, errors="replace"))
     _orig_stdout.flush()
     try:
         with open(_LOG_FILE, "a", encoding="utf-8") as f:
@@ -463,6 +467,7 @@ async def generate_video_ai(
     max_rounds: Optional[int] = Form(3, description="最大迭代轮数（1-3）"),
     backend: Optional[str] = Form(None, description="AI后端: claude/gpt（默认读 AI_BACKEND 环境变量）"),
     highlight: Optional[str] = Form(None, description="是否对原视频识别高光段并保留原音 (1/true/yes 启用)"),
+    tweet_id: Optional[str] = Form(None, description="推文ID（用于背景检索缓存与触发）"),
     video: Optional[UploadFile] = File(None, description="推文自带视频文件（可选）"),
 ):
     """
@@ -532,6 +537,7 @@ async def generate_video_ai(
                 _do_generate_ai_subprocess,
                 saved_paths, saved_video_path, trans_list, author_list, orig_list,
                 duration, max_rounds, backend, request_id, _log_queue, _highlight_flag,
+                (tweet_id or "").strip(),
             )
         finally:
             _active_request_id_clear(request_id)
@@ -557,7 +563,7 @@ def _active_request_id_clear(rid: str):
 
 def _do_generate_ai_subprocess(saved_paths, saved_video_path, trans_list, author_list, orig_list,
                                 duration, max_rounds, backend, request_id, log_queue,
-                                highlight=False):
+                                highlight=False, tweet_id=""):
     """子进程入口：重新构造 ai/logger，调用原同步流程。"""
     def _qlog(msg, level="info"):
         try:
@@ -569,7 +575,8 @@ def _do_generate_ai_subprocess(saved_paths, saved_video_path, trans_list, author
     ai = _get(backend, logger=_qlog)
     return _do_generate_ai_inner(saved_paths, saved_video_path, trans_list,
                                   author_list, orig_list, duration, max_rounds,
-                                  ai, request_id, logger=_qlog, highlight=highlight)
+                                  ai, request_id, logger=_qlog, highlight=highlight,
+                                  tweet_id=tweet_id)
 
 
 def _do_generate_ai(saved_paths, saved_video_path, trans_list, author_list, orig_list,
@@ -591,7 +598,8 @@ def _do_generate_ai(saved_paths, saved_video_path, trans_list, author_list, orig
 
 
 def _do_generate_ai_inner(saved_paths, saved_video_path, trans_list, author_list, orig_list,
-                          duration, max_rounds, ai, request_id, logger=None, highlight=False):
+                          duration, max_rounds, ai, request_id, logger=None, highlight=False,
+                          tweet_id=""):
     _vlog = logger or globals()["_vlog"]
     orig0 = orig_list[0] if orig_list else ""
     author0 = author_list[0] if author_list else ""
@@ -649,6 +657,34 @@ def _do_generate_ai_inner(saved_paths, saved_video_path, trans_list, author_list
     # 3. AI 生成解说词（用于配音，有解说感）
     _step_t = _t.time()
     _vlog("[generate-ai] 步骤3: 生成解说词")
+
+    # 3a. 全网背景检索（仅当 LLM 判断推文自身无法理解时；省 SerpAPI 月度配额）
+    context_brief = ""
+    if tweet_id:
+        try:
+            need, refined_q = ai.needs_research(orig0, polished[0], author0,
+                                               video_description=video_description)
+        except Exception as e:
+            need, refined_q = False, ""
+            _vlog(f"  needs_research 调用失败: {e}", "warn")
+        if not need:
+            _vlog("  [Research] 跳过（推文自身可理解）")
+        else:
+            try:
+                from agents.research_agent import ResearchAgent, usage_this_month
+                _researcher = ResearchAgent()
+                _used, _quota = usage_this_month()
+                _vlog(f"  [Research] 触发检索 (本月已用 {_used}/{_quota}); query={refined_q!r}")
+                _res = _researcher.research(tweet_id, orig0, author0, query_override=refined_q)
+                context_brief = _res.get("context_brief", "")
+                if context_brief:
+                    _head = context_brief[:120].replace("\n", " ")
+                    _vlog(f"  [Research] 拿到背景({len(context_brief)}字): {_head}...")
+                else:
+                    _vlog(f"  [Research] 无结果 / {_res.get('error','')}", "warn")
+            except Exception as e:
+                _vlog(f"  [Research] 检索失败: {e}", "warn")
+
     commentaries = []
     for i, trans in enumerate(polished):
         orig = orig_list[i] if orig_list and i < len(orig_list) else ""
@@ -657,7 +693,8 @@ def _do_generate_ai_inner(saved_paths, saved_video_path, trans_list, author_list
             c = ai.generate_commentary(orig, trans, author,
                                        has_video=saved_video_path is not None,
                                        video_description=video_description,
-                                       target_duration=target_video_duration)
+                                       target_duration=target_video_duration,
+                                       context_brief=context_brief if i == 0 else "")
             commentaries.append(c)
             _vlog(f"  解说词: {c}")
         except Exception as e:
