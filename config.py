@@ -11,8 +11,11 @@ BACKGROUNDS_DIR = os.path.join(ASSETS_DIR, "backgrounds")
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "output")
 TEMP_DIR = os.path.join(PROJECT_ROOT, "temp")
 
-# 默认数据源
-DEFAULT_JSON_PATH = r"C:\Users\xuqin\Documents\testssh\output\demo_results.json"
+# 默认数据源（可用 NBAVEDIO_DEFAULT_JSON 覆盖）
+DEFAULT_JSON_PATH = os.getenv(
+    "NBAVEDIO_DEFAULT_JSON",
+    os.path.join(OUTPUT_DIR, "demo_results.json"),
+)
 
 # === 视频配置 ===
 VIDEO_WIDTH = 1080
@@ -32,10 +35,29 @@ TEXT_COLOR = (226, 232, 240)      # 浅灰正文
 BORDER_COLOR = (239, 68, 68)      # 红色边框
 
 # === 字体配置 ===
-# Windows 系统中文字体路径
-FONT_PATH_BOLD = r"C:\Windows\Fonts\msyhbd.ttc"   # 微软雅黑粗体
-FONT_PATH_REGULAR = r"C:\Windows\Fonts\msyh.ttc"  # 微软雅黑常规
-FONT_PATH_LIGHT = r"C:\Windows\Fonts\msyhl.ttc"   # 微软雅黑细体
+# 解析顺序：环境变量 → 项目自带 assets/fonts/ → 系统字体目录 → PIL 默认字体
+# 任何环节缺失都不抛错，由消费方在 ImageFont.truetype 处兜底。
+def _resolve_font(env_key: str, filename: str) -> str:
+    override = os.getenv(env_key, "").strip()
+    if override:
+        return override
+    bundled = os.path.join(FONTS_DIR, filename)
+    if os.path.exists(bundled):
+        return bundled
+    candidates = [
+        os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", filename),
+        f"/usr/share/fonts/truetype/{filename}",
+        f"/Library/Fonts/{filename}",
+        f"/System/Library/Fonts/{filename}",
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return bundled  # 不存在也返回，消费方报错时路径有意义
+
+FONT_PATH_BOLD = _resolve_font("FONT_PATH_BOLD", "msyhbd.ttc")
+FONT_PATH_REGULAR = _resolve_font("FONT_PATH_REGULAR", "msyh.ttc")
+FONT_PATH_LIGHT = _resolve_font("FONT_PATH_LIGHT", "msyhl.ttc")
 
 TITLE_FONT_SIZE = 56
 SUBTITLE_FONT_SIZE = 36
