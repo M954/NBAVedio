@@ -3,6 +3,7 @@
 """
 import os
 import re
+import time
 import warnings
 warnings.filterwarnings("ignore", message=".*bytes wanted but 0 bytes read.*")
 import uuid
@@ -56,10 +57,10 @@ def _detect_video_codec():
             ffmpeg_bin = "ffmpeg"
     print(f"[Codec] 使用 ffmpeg: {ffmpeg_bin}")
     candidates = [
-        ("h264_nvenc", ["-preset", "p4", "-tune", "hq", "-rc", "vbr", "-cq", "23"]),
-        ("h264_qsv",   ["-preset", "fast", "-global_quality", "23"]),
-        ("h264_amf",   ["-quality", "speed", "-rc", "vbr_quality", "-qp_i", "23"]),
-        ("libx264",    ["-preset", "veryfast", "-crf", "23"]),
+        ("h264_nvenc", ["-preset", "p1", "-tune", "ll", "-rc", "vbr", "-cq", "30", "-b:v", "3500k", "-maxrate", "5000k", "-bufsize", "7000k"]),
+        ("h264_qsv",   ["-preset", "veryfast", "-global_quality", "30", "-b:v", "3500k", "-maxrate", "5000k"]),
+        ("h264_amf",   ["-quality", "speed", "-rc", "vbr_peak", "-b:v", "3500k", "-maxrate", "5000k"]),
+        ("libx264",    ["-preset", "veryfast", "-crf", "28", "-maxrate", "5000k", "-bufsize", "7000k"]),
     ]
     for codec, params in candidates:
         try:
@@ -754,15 +755,26 @@ class TweetVideoAgent:
         output_path = os.path.join(self.output_dir, output_name)
 
         _codec, _ffmpeg_params = _detect_video_codec()
+        print(f"[Encode] 开始 ffmpeg 编码 (codec={_codec}, 输出={output_name})，此阶段无中间日志，预计 1-10 分钟…")
+        _enc_t0 = time.time()
+        _is_gpu = _codec in ("h264_nvenc", "h264_qsv", "h264_amf")
         video.write_videofile(
             output_path,
             fps=24,
             codec=_codec,
             audio_codec="aac",
             ffmpeg_params=_ffmpeg_params,
-            threads=os.cpu_count() or 4,
+            threads=1 if _is_gpu else (os.cpu_count() or 4),
             logger=None,
         )
+        _enc_dt = time.time() - _enc_t0
+        try:
+            _size_mb = os.path.getsize(output_path) / (1024 * 1024)
+            print(f"[Encode] 编码完成: {output_name} ({_size_mb:.1f} MB, 耗时 {_enc_dt:.1f}s)")
+            if _size_mb > 10:
+                print(f"[Encode] [warn] 文件 {_size_mb:.1f}MB 超过 10MB 目标，需进一步降码率")
+        except Exception:
+            print(f"[Encode] 编码完成: {output_name} (耗时 {_enc_dt:.1f}s)")
         _mark(f"步骤7 写盘 (write_videofile, codec={_codec})")
 
         # 清理临时文件
