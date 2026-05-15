@@ -374,10 +374,77 @@ def run_pipeline(
     if saved_video_path:
         _step_t = _t.time()
         log("[generate-ai] 步骤2: 分析推文视频内容")
+
+        # 2a: 判断是否需要剪辑（仅当源视频 > MAX_SOURCE_VIDEO_DURATION）
         try:
-            video_description = ai.analyze_video_content(saved_video_path, orig0, author0)
+            from config import MAX_SOURCE_VIDEO_DURATION as _MAX_SRC
+        except Exception:
+            _MAX_SRC = 50.0
+        _src_dur = 0.0
+        try:
+            _src_dur = _collect_video_info(saved_video_path).get("duration", 0.0) or 0.0
+        except Exception as e:
+            log(f"[generate-ai] 读取源视频时长失败: {e}", "warn")
+
+        want_trim = _src_dur > _MAX_SRC
+        if want_trim:
+            log(f"[Trim] 源视频 {_src_dur:.1f}s > {_MAX_SRC:.0f}s，请求 Gemini 给出剪辑方案")
+
+        analysis = None
+        try:
+            analysis = ai.analyze_video_content(
+                saved_video_path, orig0, author0,
+                want_trim_plan=want_trim,
+                max_trim_total=_MAX_SRC,
+            )
         except Exception as e:
             log(f"[generate-ai] 视频分析失败: {e}", "warn")
+
+        # 拆分 description 与 trim_plan（兼容老返回值）
+        trim_segments_raw: list = []
+        needs_trim = False
+        trim_reason = "none"
+        if isinstance(analysis, dict):
+            video_description = analysis.get("description", "") or ""
+            needs_trim = bool(analysis.get("needs_trim"))
+            trim_reason = analysis.get("trim_reason") or "none"
+            trim_segments_raw = analysis.get("segments") or []
+        elif isinstance(analysis, str):
+            video_description = analysis
+
+        # 2b: 执行剪辑（仅当 want_trim 触发）
+        if want_trim:
+            try:
+                from utils.video_trim import normalize_segments, trim_to_segments
+
+                segs = normalize_segments(trim_segments_raw, _src_dur, _MAX_SRC)
+                if needs_trim and segs:
+                    out_dir = os.path.dirname(saved_video_path) or "."
+                    base, ext = os.path.splitext(os.path.basename(saved_video_path))
+                    trimmed_path = os.path.join(out_dir, f"{base}_trimmed{ext or '.mp4'}")
+                    log(
+                        f"[Trim] Gemini 方案 reason={trim_reason}, 段数={len(segs)}, "
+                        f"总时长={sum(e - s for s, e in segs):.1f}s → {trimmed_path}"
+                    )
+                    trim_to_segments(saved_video_path, segs, trimmed_path)
+                    saved_video_path = trimmed_path
+                    log(f"[Trim] 已替换 saved_video_path → {trimmed_path}")
+                else:
+                    # 兜底：硬截断到 MAX_SRC
+                    log(
+                        f"[Trim] Gemini 未给出可用 segments (needs_trim={needs_trim}, "
+                        f"raw={len(trim_segments_raw)}段)，回退到硬截断 0-{_MAX_SRC:.0f}s",
+                        "warn",
+                    )
+                    out_dir = os.path.dirname(saved_video_path) or "."
+                    base, ext = os.path.splitext(os.path.basename(saved_video_path))
+                    trimmed_path = os.path.join(out_dir, f"{base}_trimmed{ext or '.mp4'}")
+                    trim_to_segments(saved_video_path, [(0.0, _MAX_SRC)], trimmed_path)
+                    saved_video_path = trimmed_path
+                    log(f"[Trim] 硬截断完成 → {trimmed_path}")
+            except Exception as e:
+                log(f"[Trim] 剪辑失败，沿用原片: {e}", "warn")
+
         if video_description:
             try:
                 video_subtitles = ai.extract_video_dialogue(video_description, orig0, author0)

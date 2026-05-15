@@ -57,10 +57,13 @@ def _detect_video_codec():
             ffmpeg_bin = "ffmpeg"
     print(f"[Codec] 使用 ffmpeg: {ffmpeg_bin}")
     candidates = [
-        ("h264_nvenc", ["-preset", "p1", "-tune", "ll", "-rc", "vbr", "-cq", "30", "-b:v", "3500k", "-maxrate", "5000k", "-bufsize", "7000k"]),
-        ("h264_qsv",   ["-preset", "veryfast", "-global_quality", "30", "-b:v", "3500k", "-maxrate", "5000k"]),
-        ("h264_amf",   ["-quality", "speed", "-rc", "vbr_peak", "-b:v", "3500k", "-maxrate", "5000k"]),
-        ("libx264",    ["-preset", "veryfast", "-crf", "28", "-maxrate", "5000k", "-bufsize", "7000k"]),
+        # NVENC: p1 最快档 + 纯 CQ 模式（去掉互打架的 vbr 比特率上限），让 GPU 全速跑；
+        # bf=0 关 B 帧降低延迟；pix_fmt 固定避免格式协商。
+        ("h264_nvenc", ["-preset", "p1", "-tune", "ll", "-rc", "constqp", "-qp", "28",
+                         "-bf", "0", "-g", "120", "-pix_fmt", "yuv420p"]),
+        ("h264_qsv",   ["-preset", "veryfast", "-global_quality", "28", "-look_ahead", "0"]),
+        ("h264_amf",   ["-quality", "speed", "-rc", "cqp", "-qp_i", "28", "-qp_p", "28"]),
+        ("libx264",    ["-preset", "ultrafast", "-crf", "26", "-pix_fmt", "yuv420p"]),
     ]
     for codec, params in candidates:
         try:
@@ -625,6 +628,8 @@ class TweetVideoAgent:
         offset = narration_start
         tts_parts = []
         self.last_subtitle_timeline = []
+        _poc_subtitles = []  # PoC manifest 用
+        _poc_tts = []  # [(abs_path, start)]
 
         for sent_text, audio_path, audio_dur in sentence_audio:
             # 渲染字幕帧
@@ -643,11 +648,17 @@ class TweetVideoAgent:
             )
             subtitle_clips.append(sub_clip)
             self.last_subtitle_timeline.append((sent_text, offset, audio_dur + 0.3))
+            _poc_subtitles.append({
+                "text": sent_text, "start": offset, "duration": audio_dur + 0.3,
+                "png": os.path.abspath(sub_path), "y": int(sub_y),
+                "kind": "narration",
+            })
 
             # 配音 clip（静默字幕段跳过）
             if audio_path is not None:
                 tts_clip = AudioFileClip(audio_path).with_start(offset)
                 tts_parts.append(tts_clip)
+                _poc_tts.append({"path": os.path.abspath(audio_path), "start": offset})
 
             offset += audio_dur + gap  # 自适应句间间隔
 
@@ -680,102 +691,223 @@ class TweetVideoAgent:
                 )
                 subtitle_clips.append(_hl_clip)
                 self.last_subtitle_timeline.append((_txt, _abs_start, _dur))
+                _poc_subtitles.append({
+                    "text": _txt, "start": _abs_start, "duration": _dur,
+                    "png": os.path.abspath(_hl_path), "y": int(_hl_y),
+                    "kind": "highlight",
+                })
 
         _mark("步骤4b 高光字幕")
-        # 5. 合成视频：背景 + 字幕叠加
-        video = CompositeVideoClip(
-            [bg_clip] + subtitle_clips,
-            size=(WIDTH, HEIGHT),
-        ).with_duration(actual_duration)
 
-        _mark("步骤5 视频合成 (CompositeVideoClip)")
-        # 6. 混合音频：配音(前景) + BGM(背景)
-        bgm_raw = AudioFileClip(bgm_path)
-        if bgm_raw.duration < actual_duration:
-            from moviepy import afx as _afx
-            bgm_audio = bgm_raw.with_effects([_afx.AudioLoop(duration=actual_duration)])
-        else:
-            bgm_audio = bgm_raw.with_duration(actual_duration)
+        # 是否走 ffmpeg 快速路径——若是，跳过昂贵的 MoviePy 合成对象构建
+        _use_ff = os.environ.get("USE_FFMPEG_RENDER", "1").lower() not in ("0", "false", "no")
 
-        if tts_parts:
-            bgm_quiet = bgm_audio.with_effects([afx.MultiplyVolume(0.18)])
-            audio_tracks = [bgm_quiet] + tts_parts
-        else:
-            audio_tracks = [bgm_audio]
-
-        _mark("步骤6 音频混合")
-        # 6b. 高光原音叠加（仅当源视频存在且有 highlight_segments）
-        highlight_audio_clips = []
-        _hl_src_holder = None  # 必须在渲染期间保持 reader 存活
+        # 始终需要收集高光原音的 manifest 元数据（ffmpeg 路径要用）
+        _poc_highlight_audio = []
         if (highlight_segments and source_video
                 and os.path.exists(source_video)):
-            try:
-                from moviepy import VideoFileClip as _HVFC
-                _hl_src_holder = _HVFC(source_video)
-                if _hl_src_holder.audio:
-                    src_audio = _hl_src_holder.audio
-                    src_dur = src_audio.duration
-                    for h in highlight_segments:
-                        s = max(0.0, float(h.get("start", 0)))
-                        e = min(src_dur, float(h.get("end", 0)))
-                        if e <= s:
-                            continue
-                        abs_start = INTRO_DUR + s
-                        if abs_start >= actual_duration:
-                            continue
-                        seg = (src_audio.subclipped(s, e)
-                               .with_start(abs_start)
-                               .with_effects([afx.MultiplyVolume(0.95)]))
-                        highlight_audio_clips.append(seg)
-                    print(f"  [Highlight] 叠加 {len(highlight_audio_clips)} 段原音")
-                else:
-                    _hl_src_holder.close()
+            for h in highlight_segments:
+                s = max(0.0, float(h.get("start", 0)))
+                e = float(h.get("end", 0))
+                if e <= s:
+                    continue
+                abs_start = INTRO_DUR + s
+                if abs_start >= actual_duration:
+                    continue
+                _poc_highlight_audio.append({
+                    "src": os.path.abspath(source_video),
+                    "src_start": s, "src_end": e, "abs_start": abs_start,
+                })
+
+        video = None
+        _hl_src_holder = None
+        if not _use_ff:
+            # 5. 合成视频：背景 + 字幕叠加
+            video = CompositeVideoClip(
+                [bg_clip] + subtitle_clips,
+                size=(WIDTH, HEIGHT),
+            ).with_duration(actual_duration)
+
+            _mark("步骤5 视频合成 (CompositeVideoClip)")
+            # 6. 混合音频：配音(前景) + BGM(背景)
+            bgm_raw = AudioFileClip(bgm_path)
+            if bgm_raw.duration < actual_duration:
+                from moviepy import afx as _afx
+                bgm_audio = bgm_raw.with_effects([_afx.AudioLoop(duration=actual_duration)])
+            else:
+                bgm_audio = bgm_raw.with_duration(actual_duration)
+
+            if tts_parts:
+                bgm_quiet = bgm_audio.with_effects([afx.MultiplyVolume(0.18)])
+                audio_tracks = [bgm_quiet] + tts_parts
+            else:
+                audio_tracks = [bgm_audio]
+
+            _mark("步骤6 音频混合")
+            # 6b. 高光原音叠加（仅当源视频存在且有 highlight_segments）
+            highlight_audio_clips = []
+            if (highlight_segments and source_video
+                    and os.path.exists(source_video)):
+                try:
+                    from moviepy import VideoFileClip as _HVFC
+                    _hl_src_holder = _HVFC(source_video)
+                    if _hl_src_holder.audio:
+                        src_audio = _hl_src_holder.audio
+                        src_dur = src_audio.duration
+                        for h in highlight_segments:
+                            s = max(0.0, float(h.get("start", 0)))
+                            e = min(src_dur, float(h.get("end", 0)))
+                            if e <= s:
+                                continue
+                            abs_start = INTRO_DUR + s
+                            if abs_start >= actual_duration:
+                                continue
+                            seg = (src_audio.subclipped(s, e)
+                                   .with_start(abs_start)
+                                   .with_effects([afx.MultiplyVolume(0.95)]))
+                            highlight_audio_clips.append(seg)
+                        print(f"  [Highlight] 叠加 {len(highlight_audio_clips)} 段原音")
+                    else:
+                        _hl_src_holder.close()
+                        _hl_src_holder = None
+                except Exception as _he:
+                    print(f"  [Highlight] 原音叠加失败: {_he}")
+                    if _hl_src_holder:
+                        try: _hl_src_holder.close()
+                        except Exception: pass
                     _hl_src_holder = None
-            except Exception as _he:
-                print(f"  [Highlight] 原音叠加失败: {_he}")
-                if _hl_src_holder:
-                    try: _hl_src_holder.close()
-                    except Exception: pass
-                _hl_src_holder = None
 
-        if highlight_audio_clips:
-            audio_tracks.extend(highlight_audio_clips)
+            if highlight_audio_clips:
+                audio_tracks.extend(highlight_audio_clips)
 
-        if len(audio_tracks) > 1 or highlight_audio_clips:
-            mixed = CompositeAudioClip(audio_tracks)
-            mixed = mixed.with_duration(actual_duration)
-            video = video.with_audio(mixed)
+            if len(audio_tracks) > 1 or highlight_audio_clips:
+                mixed = CompositeAudioClip(audio_tracks)
+                mixed = mixed.with_duration(actual_duration)
+                video = video.with_audio(mixed)
+            else:
+                video = video.with_audio(audio_tracks[0])
+
+            _mark("步骤6b 高光原音叠加")
         else:
-            video = video.with_audio(audio_tracks[0])
-
-        _mark("步骤6b 高光原音叠加")
+            _mark("步骤5/6/6b 跳过 (ffmpeg fast path)")
         # 7. 渲染输出
         if not output_name:
             output_name = f"tweet_{uuid.uuid4().hex[:8]}.mp4"
         output_path = os.path.join(self.output_dir, output_name)
 
-        _codec, _ffmpeg_params = _detect_video_codec()
-        print(f"[Encode] 开始 ffmpeg 编码 (codec={_codec}, 输出={output_name})，此阶段无中间日志，预计 1-10 分钟…")
-        _enc_t0 = time.time()
-        _is_gpu = _codec in ("h264_nvenc", "h264_qsv", "h264_amf")
-        video.write_videofile(
-            output_path,
-            fps=24,
-            codec=_codec,
-            audio_codec="aac",
-            ffmpeg_params=_ffmpeg_params,
-            threads=1 if _is_gpu else (os.cpu_count() or 4),
-            logger=None,
-        )
-        _enc_dt = time.time() - _enc_t0
+        # === PoC manifest dump（用于 ffmpeg filter_complex 重渲染对比）===
         try:
-            _size_mb = os.path.getsize(output_path) / (1024 * 1024)
-            print(f"[Encode] 编码完成: {output_name} ({_size_mb:.1f} MB, 耗时 {_enc_dt:.1f}s)")
-            if _size_mb > 10:
-                print(f"[Encode] [warn] 文件 {_size_mb:.1f}MB 超过 10MB 目标，需进一步降码率")
-        except Exception:
-            print(f"[Encode] 编码完成: {output_name} (耗时 {_enc_dt:.1f}s)")
-        _mark(f"步骤7 写盘 (write_videofile, codec={_codec})")
+            import json as _json
+            import shutil as _shutil
+            # 把 PNG 素材复制到 _assets 目录，规避后续清理
+            _assets_dir = os.path.join(
+                self.output_dir,
+                output_name.replace(".mp4", "_assets"),
+            )
+            os.makedirs(_assets_dir, exist_ok=True)
+
+            def _stash(p):
+                if not p or not os.path.exists(p):
+                    return p
+                dst = os.path.join(_assets_dir, os.path.basename(p))
+                if os.path.abspath(p) != os.path.abspath(dst):
+                    _shutil.copy2(p, dst)
+                return os.path.abspath(dst)
+
+            _stashed_subs = []
+            for s in _poc_subtitles:
+                _stashed_subs.append({**s, "png": _stash(s["png"])})
+            _manifest = {
+                "output_name": output_name,
+                "width": WIDTH, "height": HEIGHT, "fps": 24,
+                "actual_duration": float(actual_duration),
+                "intro_duration": float(INTRO_DUR),
+                "frame_path": _stash(frame_path),
+                "source_video": os.path.abspath(source_video) if (source_video and os.path.exists(source_video)) else None,
+                "bgm_path": os.path.abspath(bgm_path) if bgm_path else None,
+                "subtitles": _stashed_subs,
+                "tts": _poc_tts,
+                "highlight_audio": _poc_highlight_audio,
+                "moviepy_output": os.path.abspath(output_path),
+            }
+            _man_path = os.path.join(self.output_dir, output_name.replace(".mp4", ".manifest.json"))
+            with open(_man_path, "w", encoding="utf-8") as _f:
+                _json.dump(_manifest, _f, ensure_ascii=False, indent=2)
+            print(f"[PoC] manifest 已写入: {_man_path} (素材副本 {_assets_dir})")
+        except Exception as _me:
+            print(f"[PoC] manifest dump 失败: {_me}")
+
+        _codec, _ffmpeg_params = _detect_video_codec()
+
+        # === 快速路径：ffmpeg filter_complex 直接合成（绕开 MoviePy 逐帧）===
+        _use_ff = os.environ.get("USE_FFMPEG_RENDER", "1").lower() not in ("0", "false", "no")
+        _ff_ok = False
+        if _use_ff and frame_path and bgm_path and _poc_subtitles and _poc_tts:
+            try:
+                from .ffmpeg_renderer import render as _ff_render
+
+                _bgm_vol = 0.18 if _poc_tts else 1.0
+                _ff_subs = []
+                for s in _poc_subtitles:
+                    _ff_subs.append({**s, "png": _stash(s["png"]) if False else s["png"]})
+                # 字幕 PNG 此时还在原位（清理在后），ffmpeg 读取没问题
+                _ff_subs = _poc_subtitles
+                print(f"[Encode] 走 ffmpeg 快速路径 (codec={_codec}, 输出={output_name})…")
+                _enc_t0 = time.time()
+                _ff_dt = _ff_render(
+                    output_path=output_path,
+                    width=WIDTH, height=HEIGHT, fps=24,
+                    actual_duration=actual_duration,
+                    intro_duration=INTRO_DUR,
+                    frame_path=frame_path,
+                    source_video=source_video if (source_video and os.path.exists(source_video)) else None,
+                    bgm_path=bgm_path,
+                    bgm_volume=_bgm_vol,
+                    subtitles=_ff_subs,
+                    tts=_poc_tts,
+                    highlight_audio=_poc_highlight_audio,
+                    codec=_codec,
+                    encoder_params=_ffmpeg_params,
+                    logger=lambda m: print(m),
+                )
+                _enc_dt = time.time() - _enc_t0
+                _size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                print(f"[Encode] 编码完成: {output_name} ({_size_mb:.1f} MB, 耗时 {_enc_dt:.1f}s) [ffmpeg-fast]")
+                if _size_mb > 10:
+                    print(f"[Encode] [warn] 文件 {_size_mb:.1f}MB 超过 10MB 目标，需进一步降码率")
+                _mark(f"步骤7 写盘 (ffmpeg-fast, codec={_codec})")
+                _ff_ok = True
+            except Exception as _ffe:
+                print(f"[Encode] ffmpeg 快速路径失败 ({_ffe})，fallback 到 MoviePy")
+
+        if not _ff_ok and _use_ff:
+            raise RuntimeError(
+                "ffmpeg 快速路径失败且 MoviePy 对象未构建（USE_FFMPEG_RENDER=1）。"
+                "如需 MoviePy fallback，请设 USE_FFMPEG_RENDER=0 重跑。"
+            )
+
+        if not _ff_ok:
+            print(f"[Encode] 开始 ffmpeg 编码 (codec={_codec}, 输出={output_name})，此阶段无中间日志，预计 1-10 分钟…")
+            _enc_t0 = time.time()
+            _is_gpu = _codec in ("h264_nvenc", "h264_qsv", "h264_amf")
+            video.write_videofile(
+                output_path,
+                fps=24,
+                codec=_codec,
+                audio_codec="aac",
+                ffmpeg_params=_ffmpeg_params,
+                threads=1 if _is_gpu else (os.cpu_count() or 4),
+                logger=None,
+            )
+            _enc_dt = time.time() - _enc_t0
+            try:
+                _size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                print(f"[Encode] 编码完成: {output_name} ({_size_mb:.1f} MB, 耗时 {_enc_dt:.1f}s)")
+                if _size_mb > 10:
+                    print(f"[Encode] [warn] 文件 {_size_mb:.1f}MB 超过 10MB 目标，需进一步降码率")
+            except Exception:
+                print(f"[Encode] 编码完成: {output_name} (耗时 {_enc_dt:.1f}s)")
+            _mark(f"步骤7 写盘 (write_videofile, codec={_codec})")
 
         # 清理临时文件
         if frame_path and os.path.exists(frame_path):

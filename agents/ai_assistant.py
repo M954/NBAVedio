@@ -480,19 +480,51 @@ class _BaseAssistant:
         result = self._call(prompt)
         return result.strip().strip('"').strip("'") if result else raw_translation
 
-    def analyze_video_content(self, video_path, original_text="", author=""):
-        """双 Agent 视频分析：Gemini 直传 + Claude 抽帧+音频，最后总结合并。"""
+    def analyze_video_content(self, video_path, original_text="", author="", want_trim_plan=False, max_trim_total=50.0):
+        """双 Agent 视频分析：Gemini 直传 + Claude 抽帧+音频，最后总结合并。
+
+        当 want_trim_plan=True 时，Gemini 额外返回剪辑方案，整体返回 dict：
+            {"description": str, "needs_trim": bool, "trim_reason": str,
+             "segments": [{"start": float, "end": float}, ...]}
+        否则返回纯字符串（向后兼容）。Claude/总结失败时 segments 仍以 Gemini 为准。
+        """
         import concurrent.futures
 
         ref_info = f"参考信息 — 作者: {author}，推文原文: {original_text}" if (author or original_text) else ""
 
-        gemini_prompt = (
-            f"你是专业短视频内容分析师。请分析这个视频讲述的内容和事件：\n"
-            f"1. 视频在讲什么事件/新闻/故事？涉及哪些人物？\n"
-            f"2. 视频中出现的文字、字幕、旁白说了什么？请转录关键对话。\n"
-            f"3. 这个事件的背景和意义是什么？\n"
-            f"{ref_info}\n200字以内，用中文，只返回描述。"
-        )
+        if want_trim_plan:
+            gemini_prompt = (
+                f"你是专业短视频内容分析师 + 剪辑师。请观看视频（含画面与原音）并完成两件事：\n\n"
+                f"【任务1：内容分析】\n"
+                f"1. 视频在讲什么事件/新闻/故事？涉及哪些人物？\n"
+                f"2. 视频中出现的文字、字幕、旁白说了什么？请转录关键对话。\n"
+                f"3. 这个事件的背景和意义是什么？\n"
+                f"   描述控制在 200 字以内，用中文。\n\n"
+                f"【任务2：剪辑判断】\n"
+                f"判断这段视频是否需要剪辑（过长 / 重复内容过多 / 大段无价值画面）。\n"
+                f"剪辑准则：\n"
+                f"- 保留段总时长必须 ≤ {max_trim_total:.0f}s，单段 ≥ 1s\n"
+                f"- 段不重叠、按时间升序、时间精确到 0.1s\n"
+                f"- 优先保留：关键事件画面、有信息量的对白、情绪高点、画面冲击\n"
+                f"- 剔除：重复回放/慢镜头(除非有新增价值)、长片头片尾、无人声+无动作的过场\n"
+                f"- 如果视频本身已经精炼且 ≤ {max_trim_total:.0f}s，needs_trim=false 并返回空 segments\n\n"
+                f"{ref_info}\n\n"
+                f"严格只返回一个 JSON 对象（不要 markdown 代码块、不要任何解释），格式：\n"
+                f"{{\n"
+                f'  "description": "200字以内中文内容描述",\n'
+                f'  "needs_trim": true 或 false,\n'
+                f'  "trim_reason": "too_long | repetitive | both | none",\n'
+                f'  "segments": [{{"start": 1.2, "end": 18.4}}, ...]\n'
+                f"}}"
+            )
+        else:
+            gemini_prompt = (
+                f"你是专业短视频内容分析师。请分析这个视频讲述的内容和事件：\n"
+                f"1. 视频在讲什么事件/新闻/故事？涉及哪些人物？\n"
+                f"2. 视频中出现的文字、字幕、旁白说了什么？请转录关键对话。\n"
+                f"3. 这个事件的背景和意义是什么？\n"
+                f"{ref_info}\n200字以内，用中文，只返回描述。"
+            )
         claude_prompt = (
             f"你是专业短视频内容分析师。以下是一个视频的关键帧截图和音频。\n"
             f"请分析：\n"
@@ -503,7 +535,7 @@ class _BaseAssistant:
             f"{ref_info}\n200字以内，用中文。"
         )
 
-        gemini_result = ""
+        gemini_raw = ""
         claude_result = ""
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
@@ -518,7 +550,7 @@ class _BaseAssistant:
                 try:
                     result = f.result(timeout=150)
                     if name == "gemini":
-                        gemini_result = result or ""
+                        gemini_raw = result or ""
                     else:
                         claude_result = result or ""
                     if result:
@@ -530,46 +562,83 @@ class _BaseAssistant:
                 except Exception as e:
                     self._log(f"视频分析: {name} agent 失败: {e}", "warn")
 
-        # 只有一个成功 → 直接返回
-        if gemini_result and not claude_result:
-            return gemini_result
-        if claude_result and not gemini_result:
-            return claude_result
+        # ---- 解析 Gemini 输出 ----
+        gemini_description = ""
+        trim_plan = {"needs_trim": False, "trim_reason": "none", "segments": []}
+        if want_trim_plan and gemini_raw:
+            raw = gemini_raw.strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[-1] if "\n" in raw else raw[3:]
+                if raw.endswith("```"):
+                    raw = raw[:-3]
+                raw = raw.strip()
+            try:
+                obj = json.loads(raw)
+                if isinstance(obj, dict):
+                    gemini_description = (obj.get("description") or "").strip()
+                    trim_plan["needs_trim"] = bool(obj.get("needs_trim"))
+                    trim_plan["trim_reason"] = str(obj.get("trim_reason") or "none")
+                    segs = obj.get("segments") or []
+                    if isinstance(segs, list):
+                        trim_plan["segments"] = [s for s in segs if isinstance(s, dict)]
+            except Exception as e:
+                self._log(f"[视频分析] Gemini JSON 解析失败，回退为纯文本: {e}", "warn")
+                gemini_description = gemini_raw
+        else:
+            gemini_description = gemini_raw
 
-        # 两个都成功 → 总结 agent 合并
-        if gemini_result and claude_result:
+        # ---- 合并 description ----
+        description = ""
+        if gemini_description and not claude_result:
+            description = gemini_description
+        elif claude_result and not gemini_description:
+            description = claude_result
+        elif gemini_description and claude_result:
             self._log("视频分析: 启动总结 agent 合并结果")
             summary_prompt = (
                 f"你是内容编辑。以下是两个AI对同一视频的分析结果。\n"
                 f"Gemini 能听到完整音频和看到连续画面，Claude 的画面细节更精准。\n"
                 f"请综合两者，取各自之长，去除重复和矛盾，输出200字以内的最终视频内容描述。\n\n"
-                f"=== Gemini 分析（含音频）===\n{gemini_result}\n\n"
+                f"=== Gemini 分析（含音频）===\n{gemini_description}\n\n"
                 f"=== Claude 分析（画面细节）===\n{claude_result}\n\n"
                 f"{ref_info}"
             )
-            result = self._call(summary_prompt)
-            if result and result.strip():
-                self._log(f"[视频分析-summary raw]\n{result.strip()}")
-                return result.strip()
-            return gemini_result  # 总结失败则返回 Gemini 结果
-
-        # 都失败 → fallback GPT-4o 抽帧
-        gpt_endpoint = os.environ.get("GPT_VISION_ENDPOINT", "http://localhost:23333/api/openai/v1/chat/completions")
-        fallback_prompt = (
-            f"你是专业短视频内容分析师。以下是一个视频的关键帧截图。\n"
-            f"请分析视频内容：人物、事件、文字、背景。\n"
-            f"{ref_info}\n200字以内，用中文。"
-        )
-        try:
-            self._log("视频分析: 双 agent 均失败，fallback 到 GPT-4o 抽帧")
-            return self._analyze_video_frames_gpt(
-                video_path, fallback_prompt,
-                endpoint_url=gpt_endpoint,
-                headers={"Content-Type": "application/json"},
+            try:
+                merged = self._call(summary_prompt)
+                if merged and merged.strip():
+                    self._log(f"[视频分析-summary raw]\n{merged.strip()}")
+                    description = merged.strip()
+                else:
+                    description = gemini_description
+            except Exception:
+                description = gemini_description
+        else:
+            # 都失败 → fallback GPT-4o 抽帧
+            gpt_endpoint = os.environ.get("GPT_VISION_ENDPOINT", "http://localhost:23333/api/openai/v1/chat/completions")
+            fallback_prompt = (
+                f"你是专业短视频内容分析师。以下是一个视频的关键帧截图。\n"
+                f"请分析视频内容：人物、事件、文字、背景。\n"
+                f"{ref_info}\n200字以内，用中文。"
             )
-        except Exception as e:
-            self._log(f"视频分析: GPT-4o fallback 也失败: {e}", "error")
-            return ""
+            try:
+                self._log("视频分析: 双 agent 均失败，fallback 到 GPT-4o 抽帧")
+                description = self._analyze_video_frames_gpt(
+                    video_path, fallback_prompt,
+                    endpoint_url=gpt_endpoint,
+                    headers={"Content-Type": "application/json"},
+                )
+            except Exception as e:
+                self._log(f"视频分析: GPT-4o fallback 也失败: {e}", "warn")
+                description = ""
+
+        if want_trim_plan:
+            return {
+                "description": description,
+                "needs_trim": trim_plan["needs_trim"],
+                "trim_reason": trim_plan["trim_reason"],
+                "segments": trim_plan["segments"],
+            }
+        return description
 
     def generate_commentary(self, original_text, translation, author="", has_video=False, video_description="", target_duration=0, context_brief=""):
         """生成解说词（不是简单翻译，而是有解说感的旁白）"""

@@ -93,5 +93,6 @@ SOURCE_Y = 1700             # 来源信息 Y 坐标
 # === 质量评估阈值 ===
 MIN_VIDEO_DURATION = 5.0    # 最短视频时长(秒)
 MAX_VIDEO_DURATION = 120.0  # 最长视频时长(秒)
+MAX_SOURCE_VIDEO_DURATION = 50.0  # 推文源视频上限(秒)，超过则触发 Gemini 智能剪辑
 MIN_AUDIO_QUALITY = 0.7     # 最低音频质量评分
 MIN_VISUAL_QUALITY = 0.7    # 最低画面质量评分
