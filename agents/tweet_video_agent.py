@@ -200,6 +200,43 @@ class TweetVideoAgent:
         self.voice = VoiceActor(self.audio_dir, voice="zh-CN-YunxiNeural")
         self.last_subtitle_timeline = []  # [(text, start_time, duration)]
 
+    def _purge_intermediates(self, *, keep_output_name=None):
+        """清理 output_dir 下的渲染中间产物（PNG 帧、字幕图、PoC 素材副本、manifest）。
+
+        - 不动任何 .mp4 / audio / logs / music_cache / research_cache。
+        - keep_output_name: 若给定（如本轮 output_name），保留该轮对应的 manifest/_assets。
+        """
+        if os.environ.get("KEEP_RENDER_ARTIFACTS", "0").lower() in ("1", "true", "yes"):
+            return
+        import shutil as _sh
+        try:
+            entries = os.listdir(self.output_dir)
+        except FileNotFoundError:
+            return
+        keep_assets = None
+        keep_manifest = None
+        if keep_output_name:
+            base = keep_output_name.replace(".mp4", "")
+            keep_assets = base + "_assets"
+            keep_manifest = base + ".manifest.json"
+        for f in entries:
+            full = os.path.join(self.output_dir, f)
+            if f == keep_assets or f == keep_manifest:
+                continue
+            # PNG 中间帧/字幕
+            if f.endswith(".png") and (
+                f.startswith("frame_") or f.startswith("sub_") or f.startswith("hl_")
+            ):
+                try: os.remove(full)
+                except Exception: pass
+            # PoC 素材副本目录
+            elif f.endswith("_assets") and os.path.isdir(full):
+                _sh.rmtree(full, ignore_errors=True)
+            # PoC manifest
+            elif f.endswith(".manifest.json"):
+                try: os.remove(full)
+                except Exception: pass
+
     def _create_frame(self, screenshot_path, translation="", author=""):
         """
         将推特截图组合为一帧竖屏画面（截图居中，不显示翻译）
@@ -419,6 +456,10 @@ class TweetVideoAgent:
         """
         if not images:
             raise ValueError("至少需要一张截图")
+
+        # 开工清场：清掉上一轮的中间产物（包括崩在中间未清理的）
+        self._purge_intermediates()
+
         if len(translations) < len(images):
             translations = translations + [""] * (len(images) - len(translations))
         if not authors:
@@ -909,17 +950,7 @@ class TweetVideoAgent:
                 print(f"[Encode] 编码完成: {output_name} (耗时 {_enc_dt:.1f}s)")
             _mark(f"步骤7 写盘 (write_videofile, codec={_codec})")
 
-        # 清理临时文件
-        if frame_path and os.path.exists(frame_path):
-            try:
-                os.remove(frame_path)
-            except Exception:
-                pass
-        for f in os.listdir(self.output_dir):
-            if f.startswith("sub_") and f.endswith(".png"):
-                try:
-                    os.remove(os.path.join(self.output_dir, f))
-                except Exception:
-                    pass
+        # 收尾清场（复用同一个清理逻辑）
+        self._purge_intermediates()
 
         return output_path
