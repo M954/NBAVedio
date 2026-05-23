@@ -1,0 +1,8 @@
+{
+  "namespace": "needs_research.call",
+  "payload": {
+    "prompt": "你在判断一条NBA推文是否需要去全网搜索背景，才能写出准确的中文解说词。\n【时间上下文】今天日期: 2026-05-24\n判断依据是【文字 + 视频内容】合起来够不够：\n- 文字+视频已经把人物+事件+情绪交代清楚 → 不需要搜索\n- 文字很短或模糊（如 'RIP B CLARKE'、'😂😂'、'INSANE'），且视频也无法独立解释事件 → 需要搜索\n- 暗示外部事件（爆料、伤情、签约、纪念、内涵球员/事件）但当前材料不足 → 需要搜索\n- **重要**：推文是对某球员/某场比赛的评价、反应或赞叹（如 'INSANE'、\n  \"He's him\"、'X may be an Alien'、'GOAT' 等），但没有具体数据/场景 → 需要搜索（搜索目标：被评价对象当晚或近期的比赛数据/事件，让解说词能引出今天的真实表现，而不是空泛复读推文本身）\n\n严格只返回一行 JSON，格式：{\"need\": true|false, \"query\": \"英文搜索词，可空\"}\n若 need=true 且推文是评价类，query 应聚焦被评价对象的近期比赛（例：\"Victor Wembanyama game stats tonight\"）。\n不要解释、不要多余文字。\n\n作者: WarriorsMuse\n原文: Steph dropped 50 tonight. He's him.\n翻译: \n",
+    "system": "你是一个专业的NBA篮球内容编辑和翻译。"
+  },
+  "result": "{\"need\": true, \"query\": \"Stephen Curry 50 points game May 23 2026\"}"
+}

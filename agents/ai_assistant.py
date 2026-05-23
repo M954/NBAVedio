@@ -6,6 +6,7 @@
   - API 调用时可通过 backend 参数覆盖
 """
 import base64
+import datetime
 import json
 import os
 import re
@@ -683,6 +684,9 @@ class _BaseAssistant:
             f"你是篮球邮差Melo风格的NBA短视频博主。请模仿以下范例的解说风格：\n\n"
             f"{examples_text}\n\n"
             f"==========================================\n"
+            f"【时间上下文】今天日期: {datetime.date.today().isoformat()}\n"
+            f"写'今日''今晚''最近''本赛季''季后赛阶段'等时间词时必须以此为准，不要凭训练数据猜测。\n"
+            f"==========================================\n"
             f"⚠️ 最高优先级：解说词是整个视频的灵魂，必须同时满足【完整】+【顺畅可读】\n"
             f"==========================================\n"
             f"【完整性硬要求】\n"
@@ -718,15 +722,21 @@ class _BaseAssistant:
             f"原文: {original_text}\n"
             f"翻译: {translation}\n\n"
             + (
-                "【背景资料（已由检索 + LLM 事实抽取得到的结构化要点）】\n"
+                "【背景资料（由检索筛选得到：一句话摘要 + 相关原文 snippet）】\n"
                 f"{context_brief}\n\n"
                 "对背景资料的使用规则（强制）：\n"
-                "- 如果背景里有具体的「主体/身份/时间/事件」字段，解说词必须把这些事实交代清楚，"
-                "不能用'某球员''有人去世'这类模糊指代替代具体身份与事件。\n"
-                "- 不得脑补背景里没有的人物关系（例如'发小''队友''兄弟'，除非背景明确说了），"
-                "只能基于背景里写明的事实。\n"
-                "- 如果背景里出现「⚠️ 注意」或「置信度低」字样，按提示处理：宁可少说也不要编造。\n"
-                "- 不要逐条朗读背景条目，要把事实自然融进解说里。\n\n"
+                "- **硬事实只能用原文 snippet 里出现过的字面信息**：对手球队、Game几、"
+                "系列赛比分、具体分数、伤情、城市、日期。snippet 里没有就不要写——"
+                "严禁从训练数据或常识补全（例：snippet 只说 vs OKC 就不能写成对阵森林狼）。\n"
+                "- 如果原文里出现 WCF/Conference Finals → 是西决/东决；ECF → 东决；"
+                "NBA Finals → 总决赛；Conference Semifinals → 次轮；First Round → 首轮。"
+                "请识别并在解说里用对应的中文措辞，不要笼统说『季后赛』『关键战』。\n"
+                "- 季后赛/总决赛/历史时刻 → 写出量级感和紧张感；交易/伤情 → 写出影响范围；"
+                "纪念类 → 用「缅怀」「致敬」「走完一生」等克制措辞；常规赛普通表现别硬拔高。\n"
+                "- 不得脑补 snippet 里没有的人物关系（'发小''队友''兄弟'除非明确说了）。\n"
+                "- 如果背景出现「检索置信度低」或「矛盾」字样：宁可少说也不要编造，"
+                "解说词就基于推文本身写，不要硬塞背景。\n"
+                "- 不要逐条朗读 snippet，要把事实自然融进解说里。\n\n"
                 if context_brief else ""
             ) +
             f"再次提醒：返回前在心里默念一遍解说词，确认【完整、顺口、能让人听懂】才提交。"
@@ -742,6 +752,38 @@ class _BaseAssistant:
             return text
         return translation
 
+    # 评价/赞叹类推文的启发式关键词（中英混合）
+    # 命中 + 推文较短 → 强制触发 research，避免解说词只能复读推文本身
+    _REACTION_KEYWORDS = (
+        "goat", "g.o.a.t", "🐐", "insane", "unreal", "incredible", "ridiculous",
+        "different", "he's him", "hes him", "she's her", "cooked", "cooking",
+        "alien", "👽", "monster", "cold", "nasty", "filthy", "elite", "mvp",
+        "unstoppable", "deadly", "menace", "wow", "damn", "crazy", "absurd",
+        "historic", "legendary", "got next",
+        # 中文/翻译后可能命中的
+        "外星人", "无解", "炸裂", "封神", "历史级", "巅峰", "统治",
+    )
+
+    @staticmethod
+    def _looks_like_reaction(original_text, translation):
+        """推文是否像「对某球员/某场比赛的简短评价/赞叹」。
+        命中条件：(a) 长度较短（原文 ≤120 字符）；(b) 含赞叹关键词。
+        这类推文字面信息完整但缺事实背景（比如对方当晚的具体数据），
+        如果不去 research，解说词只能复读推文本身，写不出"今天的比赛"。
+        """
+        text_en = (original_text or "").strip()
+        text_cn = (translation or "").strip()
+        if not text_en and not text_cn:
+            return False
+        # 长推文通常自带细节，不算赞叹类
+        if len(text_en) > 120:
+            return False
+        low_en = text_en.lower()
+        for kw in _BaseAssistant._REACTION_KEYWORDS:
+            if kw in low_en or kw in text_cn:
+                return True
+        return False
+
     def needs_research(self, original_text, translation, author="", video_description=""):
         """LLM 判断推文是否需要外部检索补充背景。
         返回 (need: bool, query: str)。query 为空时调用方用默认 query。
@@ -749,6 +791,9 @@ class _BaseAssistant:
 
         video_description: 已分析的推文自带视频内容描述（如有）。文字+视频合起来
         仍模糊才需要搜；纯文字模糊但视频已经把事讲清的情况判 False。
+
+        启发式兜底：若推文像"球员/媒体对某场比赛的简短评价"（短文本 + 赞叹关键词），
+        即使 LLM 判 False 也强制触发 research——否则解说词写不出今天的比赛细节。
         """
         video_block = ""
         if video_description:
@@ -759,11 +804,18 @@ class _BaseAssistant:
             )
         prompt = (
             "你在判断一条NBA推文是否需要去全网搜索背景，才能写出准确的中文解说词。\n"
+            f"【时间上下文】今天日期: {datetime.date.today().isoformat()}\n"
             "判断依据是【文字 + 视频内容】合起来够不够：\n"
             "- 文字+视频已经把人物+事件+情绪交代清楚 → 不需要搜索\n"
             "- 文字很短或模糊（如 'RIP B CLARKE'、'😂😂'、'INSANE'），且视频也无法独立解释事件 → 需要搜索\n"
-            "- 暗示外部事件（爆料、伤情、签约、纪念、内涵球员/事件）但当前材料不足 → 需要搜索\n\n"
+            "- 暗示外部事件（爆料、伤情、签约、纪念、内涵球员/事件）但当前材料不足 → 需要搜索\n"
+            "- **重要**：推文是对某球员/某场比赛的评价、反应或赞叹（如 'INSANE'、\n"
+            "  \"He's him\"、'X may be an Alien'、'GOAT' 等），但没有具体数据/场景 → "
+            "需要搜索（搜索目标：被评价对象当晚或近期的比赛数据/事件，让解说词能引出"
+            "今天的真实表现，而不是空泛复读推文本身）\n\n"
             "严格只返回一行 JSON，格式：{\"need\": true|false, \"query\": \"英文搜索词，可空\"}\n"
+            "若 need=true 且推文是评价类，query 应聚焦被评价对象的近期比赛"
+            "（例：\"Victor Wembanyama game stats tonight\"）。\n"
             "不要解释、不要多余文字。\n\n"
             f"作者: {author}\n原文: {original_text}\n翻译: {translation}\n"
             f"{video_block}"
@@ -772,11 +824,24 @@ class _BaseAssistant:
             raw = self._call(prompt) or ""
             m = re.search(r"\{.*\}", raw, re.S)
             if not m:
-                return False, ""
-            data = json.loads(m.group(0))
-            return bool(data.get("need")), str(data.get("query") or "").strip()
+                need_llm, query_llm = False, ""
+            else:
+                data = json.loads(m.group(0))
+                need_llm = bool(data.get("need"))
+                query_llm = str(data.get("query") or "").strip()
         except Exception:
-            return False, ""
+            need_llm, query_llm = False, ""
+
+        # 启发式兜底（B）：评价/赞叹类短推文强制触发 research。
+        # 即使 LLM 判 False，只要命中关键词且长度短，也认为需要查——因为这类
+        # 推文字面"自身可理解"但缺今天的比赛事实，下游 ScriptWriter 只能复读。
+        if not need_llm and self._looks_like_reaction(original_text, translation):
+            self._log(
+                "  [needs_research] LLM 判 False，但命中评价类启发式 → 强制 research"
+            )
+            return True, query_llm  # query 留空，让 ResearchAgent 用默认 query
+
+        return need_llm, query_llm
 
     def recommend_music_claude(self, blog_content, author=""):
         """推荐最适合的配乐歌曲（英文 prompt，更适合音乐推荐）"""
@@ -884,12 +949,60 @@ class _BaseAssistant:
         # 双 agent 分析视频内容
         video_analysis = ""
         subtitle_check = ""
+        # 注入今天日期——避免 LLM 用训练截止日期判定"未来日期"为伪造
+        today_str = datetime.date.today().isoformat()
+        date_context = (
+            f"=== 时间上下文（重要） ===\n"
+            f"今天日期: {today_str}\n"
+            f"判断推文截图日期/比赛日期/事件时间时必须以此为准；\n"
+            f"看到与你训练数据不符的日期（如 2026/2027）不等于伪造——以本日期为真实当下。\n\n"
+        )
+        # 输入限制 + 检索背景上下文——告诉 review LLM 用户实际给了什么素材、
+        # 解说词里的硬事实有没有外部权威来源，避免把"画面单调"或"无集锦素材"
+        # 误判到"内容准确性"维度上去。
+        has_src = bool(video_info.get("has_source_video"))
+        ctx_brief = (video_info.get("context_brief") or "").strip()
+        input_block = (
+            f"=== 用户实际输入的素材（重要：决定哪些是合理缺陷、哪些不是） ===\n"
+            f"- 推文截图：有\n"
+            f"- 推文自带视频/集锦素材：{'有（剪辑后用作背景）' if has_src else '无（用户只给了一张推文截图）'}\n"
+            f"{'⚠️ 注意：用户没给比赛集锦/球员镜头素材，整个视频背景就只能是这张推文截图。' if not has_src else ''}\n"
+            f"{'  →【硬规则】不要把『画面单调』『缺少比赛画面/集锦/B-roll』『8 帧都是推文截图』算到「内容准确性」扣分，这是用户输入限制，不是解说词的错。' if not has_src else ''}\n"
+            f"{'  →【硬规则】如果想反映这一点，归到「视觉效果」维度，且只能算「中性观察」而非扣分点。' if not has_src else ''}\n\n"
+        )
+        brief_block = ""
+        if ctx_brief:
+            brief_block = (
+                f"=== 解说词所基于的外部检索背景（重要：判断事实是否凭空捏造时必读） ===\n"
+                f"{ctx_brief}\n\n"
+                f"⚠️【硬规则】解说词中的硬事实（球员数据、对手、比分、系列赛阶段、伤情等）"
+                f"只要能在【上面这段检索背景的原文 snippet】里找到字面证据，就属于"
+                f"『有权威来源』，**不算编造、不算『画面无佐证』、不能扣内容准确性的分**。\n"
+                f"画面有无对应镜头是『视觉』维度的问题；事实是否凭空捏造才是『内容』维度。"
+                f"两者不要混。\n\n"
+            )
+        # 维度归属硬约束：明确告诉 review LLM 哪些问题该归哪一维，避免一锅端到"内容准确性"
+        dimension_rules = (
+            f"=== 维度归属硬约束（务必遵守） ===\n"
+            f"评审时若发现问题，必须按下表归类，不要把跨维度问题混塞进单一维度：\n"
+            f"- 解说词与推文/检索背景的事实是否一致 → 「内容准确性」\n"
+            f"- 画面是否单调/缺少 B-roll/帧重复 → 「视觉效果」（不归内容）\n"
+            f"- TTS 发音清晰度/Whisper 识别误差/录音质量 → 「配音效果」（不归内容）\n"
+            f"- 字幕错位/字号/可读性 → 「视觉效果」（不归内容）\n"
+            f"- BGM 风格/音量 → 「配乐质量」（不归内容）\n"
+            f"- 解说风格是否口语/有无钩子 → 「解说风格」（不归内容）\n"
+            f"特别提醒：把 TTS 含糊、画面单调这类问题误算到「内容准确性」扣分是常见错误，请避免。\n\n"
+        )
         if video_path and os.path.exists(video_path):
             import concurrent.futures
 
             # Gemini review prompt（针对内容质量评审）
             review_prompt = (
                 f"你是专业短视频审阅员。请从以下维度审阅这个视频：\n\n"
+                f"{date_context}"
+                f"{input_block}"
+                f"{brief_block}"
+                f"{dimension_rules}"
                 f"=== 预期内容 ===\n"
                 f"解说词: {video_info.get('commentary', '')}\n"
                 f"推文原文: {video_info.get('original_text', '')}\n"
@@ -916,6 +1029,10 @@ class _BaseAssistant:
                 )
                 claude_prompt = (
                     f"你是短视频审阅员。以下是一个视频的关键帧截图（每帧对应一条字幕）和音频。\n\n"
+                    f"{date_context}"
+                    f"{input_block}"
+                    f"{brief_block}"
+                    f"{dimension_rules}"
                     f"=== 预期内容 ===\n"
                     f"解说词: {video_info.get('commentary', '')}\n"
                     f"推文原文: {video_info.get('original_text', '')}\n"

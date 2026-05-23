@@ -5,6 +5,7 @@
 
 无 SERPAPI_KEY、网络失败、零结果时返回空字符串，调用方应当无背景继续走旧流程。
 """
+import datetime
 import json
 import os
 import re
@@ -29,6 +30,10 @@ _TWEETS_JSON = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "NBACrawler", "output", "tweets.json",
 )
+
+# Cache schema 版本——_extract_facts 的输出字段集发生破坏性变更时 +1
+# 老 cache 缺关键字段或版本不符时 _load_cache 会自动忽略并重跑事实抽取
+_CACHE_SCHEMA_VERSION = 4  # v4: 极简 3 字段（summary + raw_snippets_relevant + confidence），下游直读原文
 
 
 def cleanup_orphan_cache():
@@ -121,13 +126,25 @@ class ResearchAgent:
         if os.path.exists(path):
             try:
                 with open(path, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                    payload = json.load(f)
             except Exception:
                 return None
+            # Schema 兼容性检查：版本不符 → 忽略 cache 重跑
+            if payload.get("_schema_version") != _CACHE_SCHEMA_VERSION:
+                return None
+            # v4 极简 schema：facts 高/中置信度时必须含 summary 字段
+            facts = payload.get("facts") or {}
+            confidence = (facts.get("confidence") or "").lower()
+            if confidence and confidence != "low":
+                if "summary" not in facts:
+                    return None
+            return payload
         return None
 
     def _save_cache(self, tweet_id, payload):
         try:
+            payload = dict(payload)
+            payload["_schema_version"] = _CACHE_SCHEMA_VERSION
             with open(self._cache_path(tweet_id), "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
         except Exception:
@@ -253,76 +270,108 @@ class ResearchAgent:
         return payload
 
     def _extract_facts(self, tweet_text, author, slim_results, raw_brief):
-        """调一次 LLM 把 SerpAPI snippets 浓缩成结构化事实 + 渲染中文 brief。
-        没注入 ai 或解析失败时回退到 raw_brief，facts 返回空 dict。"""
+        """让 LLM 做轻量"筛选 + 置信度判断"，不再抽硬事实字段。
+        硬事实（对手/场次/比分）留给下游 ScriptWriter 直接读 raw snippets ——
+        少一层 LLM 转换 = 少一次幻觉机会。
+
+        返回 (facts, brief)，facts 只含三字段：
+          - summary: 一句话浓缩相关搜索结果讲的事
+          - raw_snippets_relevant: 从原始 snippet 里挑出的最相关原文（保留 link/source）
+          - confidence: high/medium/low
+        brief 渲染：summary 一行 + 相关 snippet 原样列出，让下游自行核对硬事实。
+        """
         if not self.ai or not slim_results:
             return {}, raw_brief
         sources_text = "\n".join(
-            f"[{i}] {r.get('title','')} —— {r.get('snippet','')}"
+            f"[{i}] {r.get('title','')} —— {r.get('snippet','')}  ({r.get('source','')})"
             for i, r in enumerate(slim_results, 1)
         )
+        today_str = datetime.date.today().isoformat()
         prompt = (
-            "你在帮一个NBA短视频博主从全网搜索结果里提炼事实。原推文很短，"
-            "需要你判断这些搜索结果在讲什么、和推文有没有关系，提炼出可写进解说词的硬事实。\n\n"
+            "你在帮一个NBA短视频博主从全网搜索结果里筛选相关内容。\n"
+            "你的任务【只有筛选 + 一句话总结 + 置信度判断】，不要试图抽取结构化字段，"
+            "也不要重写事实——硬事实（对手、场次、比分、伤情）下游会直接读原始 snippet。\n\n"
+            f"【时间上下文】今天日期: {today_str}\n"
+            f"搜索结果里的日期是真实的，不要因为与你训练数据不符就当成伪造。\n\n"
             f"原推文（作者: {author or '未知'}）:\n{tweet_text}\n\n"
-            f"全网搜索结果（多来源，质量参差，注意筛选）:\n{sources_text}\n\n"
-            "请严格输出一个 JSON 对象（不要 markdown 代码块、不要解释），包含字段：\n"
+            f"全网搜索结果（多来源，质量参差）:\n{sources_text}\n\n"
+            "请严格输出一个 JSON 对象（不要 markdown 代码块、不要解释），三个字段：\n"
             "{\n"
-            '  "subject": "推文核心人物或事件主体的中文称呼（如有具体身份必须写出，例：灰熊队后卫Brandon Clarke）",\n'
-            '  "identity": "该主体的身份/所属球队/年龄/职业等关键背景，按搜索结果如实写；不知道就写空字符串",\n'
-            '  "when": "事件发生的时间，能确定写具体；不确定写空字符串",\n'
-            '  "what": "推文实际在讲的事件本身（一句话，必须基于搜索结果，不要复述推文措辞）",\n'
-            '  "why_or_context": "事件背景/起因/相关上下文，没有就空字符串",\n'
-            '  "reactions": "他人或舆论反应，没有就空字符串",\n'
-            '  "confidence": "high/medium/low，搜索结果与推文相关度的把握",\n'
-            '  "warnings": "如发现搜索结果之间互相矛盾、或与推文人物关系不明，写一句提醒；否则空字符串"\n'
+            '  "summary": "一句话总结相关搜索结果在讲什么，必须基于原文 snippet，'
+            '不要复述推文措辞，不要引入 snippet 没说的细节（人物关系、对手球队等）。'
+            '如果多条 snippet 互相矛盾，写明矛盾点而不是任选一个。20-60字。",\n'
+            '  "relevant_indices": [挑出与推文最相关的 snippet 编号数组，例 [1,2,5]；'
+            '宁缺勿滥，不相关的别选；可以为空数组],\n'
+            '  "confidence": "high (snippet 明确讲推文同一件事) / medium (有相关但不完整) / '
+            'low (相关度低或互相矛盾)"\n'
             "}\n\n"
             "硬规则：\n"
             "- 只输出 JSON，不要任何前后文字\n"
-            "- 字段值里不得编造搜索结果中没有的信息（人物关系、死因等）\n"
-            "- subject 一定要带具体身份（球队/位置/年龄），否则解说词会编造\n"
-            "- 如果搜索结果质量很差或与推文无关，confidence 写 low，subject 留空，让上游知道别用\n"
+            "- summary 里不得编造 snippet 中没出现的硬事实（对手球队名、Game几、比分、死因等）\n"
+            "- relevant_indices 必须是 snippet 真实编号（1..N），不存在的编号不要写\n"
+            "- 多条 snippet 讲不同事件时，只挑与推文最对得上的那些；矛盾就在 summary 里点出来\n"
+            "- 不确定就给 medium 或 low，不要硬给 high\n"
         )
         try:
-            raw = self.ai._call(prompt, system="你是一个严谨的事实抽取助手，只输出合法 JSON。")
+            raw = self.ai._call(prompt, system="你是一个严谨的检索结果筛选器，只输出合法 JSON。")
             if not raw:
                 return {}, raw_brief
             m = re.search(r"\{[\s\S]*\}", raw)
             if not m:
                 return {}, raw_brief
-            facts = json.loads(m.group(0))
+            parsed = json.loads(m.group(0))
         except Exception:
             return {}, raw_brief
-        # 渲染成 generate_commentary 可直接吃的中文 brief
-        confidence = (facts.get("confidence") or "").lower()
-        if confidence == "low" or not facts.get("subject"):
-            # 把控低质：上游 prompt 会看到 confidence 提示，避免照搬
+
+        summary = (parsed.get("summary") or "").strip()
+        confidence = (parsed.get("confidence") or "").strip().lower()
+        if confidence not in ("high", "medium", "low"):
+            confidence = "low"
+        # 校验 relevant_indices 并拿到对应的原始 snippet 子集
+        raw_indices = parsed.get("relevant_indices") or []
+        relevant = []
+        if isinstance(raw_indices, list):
+            seen = set()
+            for v in raw_indices:
+                try:
+                    idx = int(v)
+                except Exception:
+                    continue
+                if 1 <= idx <= len(slim_results) and idx not in seen:
+                    seen.add(idx)
+                    relevant.append(slim_results[idx - 1])
+        # 没挑出任何相关 snippet 但 confidence>=medium 时降级——避免空腹喂下游
+        if not relevant and confidence != "low":
+            confidence = "low"
+
+        facts = {
+            "summary": summary,
+            "raw_snippets_relevant": relevant,
+            "confidence": confidence,
+        }
+
+        # 低置信度：明确告诉下游"别引入背景"
+        if confidence == "low":
             brief = (
-                "【背景检索置信度低，搜索结果与推文相关性不强，建议解说词不要引入额外背景】\n"
-                + (facts.get("warnings") or "")
+                "【背景检索置信度低，搜索结果与推文相关性不强或互相矛盾，"
+                "解说词不要引入额外背景，只基于推文本身写】\n"
+                + (f"参考摘要：{summary}" if summary else "")
             )
             return facts, brief
+
+        # 高/中置信度：summary 一行打头 + 相关 snippet 原文按编号列出
         lines = []
-        subj = facts.get("subject") or ""
-        ident = facts.get("identity") or ""
-        when = facts.get("when") or ""
-        what = facts.get("what") or ""
-        ctx = facts.get("why_or_context") or ""
-        reactions = facts.get("reactions") or ""
-        warnings = facts.get("warnings") or ""
-        if subj:
-            lines.append(f"- 主体：{subj}")
-        if ident:
-            lines.append(f"- 身份/背景：{ident}")
-        if when:
-            lines.append(f"- 时间：{when}")
-        if what:
-            lines.append(f"- 事件：{what}")
-        if ctx:
-            lines.append(f"- 起因/背景：{ctx}")
-        if reactions:
-            lines.append(f"- 反应：{reactions}")
-        if warnings:
-            lines.append(f"- ⚠️ 注意：{warnings}")
-        brief = "\n".join(lines) if lines else raw_brief
+        if summary:
+            lines.append(f"⭐ 检索摘要（置信度 {confidence}）：{summary}")
+        lines.append("")
+        lines.append("【相关原文 snippet（请直接基于以下原文写解说，硬事实必须在这里找得到字面证据）】")
+        for i, r in enumerate(relevant, 1):
+            title = (r.get("title") or "").strip()
+            snippet = (r.get("snippet") or "").strip()
+            source = (r.get("source") or "").strip()
+            piece = f"[{i}] {title}\n    {snippet}"
+            if source:
+                piece += f"  —— {source}"
+            lines.append(piece)
+        brief = "\n".join(lines)
         return facts, brief

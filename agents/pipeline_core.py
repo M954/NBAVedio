@@ -208,6 +208,7 @@ def _iterate_with_review(
     orig0: str,
     author0: str,
     video_description: str,
+    context_brief: str,
     logger: Callable[..., None],
     on_cancel: Optional[Callable[[], bool]],
 ) -> tuple:
@@ -245,6 +246,7 @@ def _iterate_with_review(
         "original_text": orig0,
         "author": author0,
         "video_description": video_description,
+        "context_brief": context_brief,
         "bgm_song": cur_song or "BGM库",
         "mood": mood,
         "has_narration": True,
@@ -602,6 +604,7 @@ def run_pipeline(
             orig0=orig0,
             author0=author0,
             video_description=video_description,
+            context_brief=context_brief,
             logger=log,
             on_cancel=on_cancel,
         )
