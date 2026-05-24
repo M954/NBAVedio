@@ -320,7 +320,10 @@ class ResearchAgent:
             if not m:
                 return {}, raw_brief
             parsed = json.loads(m.group(0))
-        except Exception:
+        except (json.JSONDecodeError, ValueError, OSError) as _e:
+            # 只吞预期异常(LLM 返回非 JSON / 网络问题)。
+            # 程序员错误必须冒上去——Bug H 教训:不要被宽 except 静默。
+            print(f"  [ResearchAgent] _extract_facts 解析失败: {type(_e).__name__}: {_e}")
             return {}, raw_brief
 
         summary = (parsed.get("summary") or "").strip()

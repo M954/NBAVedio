@@ -829,7 +829,11 @@ class _BaseAssistant:
                 data = json.loads(m.group(0))
                 need_llm = bool(data.get("need"))
                 query_llm = str(data.get("query") or "").strip()
-        except Exception:
+        except (json.JSONDecodeError, ValueError, OSError) as e:
+            # 只吞预期异常:LLM 返回非 JSON / 网络问题 / 解析失败。
+            # 程序员错误(AttributeError / NameError / TypeError) 必须冒上去——
+            # Bug H 教训:宽 except 会把启发式兜底的死代码静默化。
+            self._log(f"  [needs_research] LLM 调用/解析失败: {type(e).__name__}: {e}", "warn")
             need_llm, query_llm = False, ""
 
         # 启发式兜底（B）：评价/赞叹类短推文强制触发 research。
@@ -1071,8 +1075,9 @@ class _BaseAssistant:
                             claude_result = r or ""
                         if r:
                             self._log(f"[Review-{name} raw]\n{_truncate(r, 300)}")
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        # 整个 review batch 失败:必须可见,否则就是 Bug H 同类问题。
+                        self._log(f"[Review-{name}] 调用失败: {type(_e).__name__}: {_e}", "warn")
 
             if subtitle_timeline:
                 subtitle_check = claude_result
@@ -1169,8 +1174,8 @@ class _BaseAssistant:
                     if part:
                         partials.append(f"[图像批{batch_idx}观察] {part}")
                         self._log(f"[Review-Claude图像批{batch_idx} raw]\n{_truncate(part, 200)}")
-                except Exception:
-                    pass
+                except Exception as _e:
+                    self._log(f"[Review-Claude图像批{batch_idx}] 失败: {type(_e).__name__}: {_e}", "warn")
             system_msg = "你是专业短视频审阅员。必须以纯JSON格式返回结果，不要包含markdown代码块标记。评分要严格，不要给人情分。"
             if partials:
                 merge_prompt = (

@@ -9,6 +9,7 @@
 * ``ai`` / ``agent`` 由调用方注入，便于测试与复用。
 * 通过 ``logger`` 注入日志通道；默认实现走 ``print``。
 * 通过 ``on_cancel`` 回调实现取消支持（可为 ``None``，等价于不取消）。
+* 通过 ``trace`` 注入结构化 trace；默认 ``NullTrace`` 100% 无开销。
 """
 
 from __future__ import annotations
@@ -19,6 +20,8 @@ import time as _t
 import uuid
 from dataclasses import dataclass, field
 from typing import Callable, Optional
+
+from .trace_logger import NullTrace, TraceLogger  # noqa: F401  re-export for callers
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +48,8 @@ class PipelineResult:
     full_review: dict
     cancelled: bool = False
     video_description: str = ""
+    quality_warning: Optional[str] = None
+    """非空时表示成片未达 A 级阈值,字符串描述具体原因(供 UI/调用方决定是否展示警示)。"""
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +289,7 @@ def _finalize(
     cancelled: bool,
     logger: Callable[..., None],
     output_dir: Optional[str],
+    quality_warning: Optional[str] = None,
 ) -> PipelineResult:
     """拷贝最佳成片到最终路径并构造 PipelineResult。"""
     final_name = f"tweet_{request_id}.mp4"
@@ -316,6 +322,7 @@ def _finalize(
         full_review=best_review,
         cancelled=cancelled,
         video_description=video_description,
+        quality_warning=quality_warning,
     )
 
 
@@ -341,19 +348,33 @@ def run_pipeline(
     logger: Optional[Callable[..., None]] = None,
     on_cancel: Optional[Callable[[], bool]] = None,
     output_dir: Optional[str] = None,
+    trace: Optional["NullTrace"] = None,
 ) -> PipelineResult:
     """执行完整的 AI 视频生成流水线（步骤 1-8）。
 
     与 ``tweet_api._do_generate_ai_inner`` 行为等价，但完全不依赖 tweet_api
-    的全局状态。``ai`` / ``agent`` 必须由调用方注入。"""
+    的全局状态。``ai`` / ``agent`` 必须由调用方注入。
+
+    ``trace`` 用于落结构化事件 jsonl;不传则使用 NullTrace,无开销。"""
 
     log = logger or _default_logger
+    trace = trace or NullTrace()
     if not request_id:
         request_id = uuid.uuid4().hex[:8]
 
     orig0 = orig_list[0] if orig_list else ""
     author0 = author_list[0] if author_list else ""
     _pipeline_start = _t.time()
+
+    trace.event(
+        "pipeline_start",
+        request_id=request_id,
+        tweet_id=tweet_id,
+        author=author0,
+        orig_preview=(orig0 or "")[:120],
+        max_rounds=max_rounds,
+        has_source_video=bool(saved_video_path),
+    )
 
     # ---- 步骤 1: AI 优化翻译 ----
     _step_t = _t.time()
@@ -580,11 +601,13 @@ def run_pipeline(
     for rnd in range(1, max_rounds + 1):
         if on_cancel and on_cancel():
             log("[generate-ai] 收到取消请求，停止生成", "warn")
+            trace.event("cancelled", round=rnd, phase="before_generate")
             cancelled = True
             break
 
         _rnd_t = _t.time()
         log(f"[generate-ai] 第{rnd}轮生成中...")
+        trace.event("round_start", round=rnd, commentary_preview=cur_commentary[:200], song=cur_song)
 
         video_path, review, cancel_hit = _iterate_with_review(
             rnd=rnd,
@@ -640,6 +663,17 @@ def run_pipeline(
             "song": cur_song,
             "suggestions": suggestions,
         })
+        trace.event(
+            "round_end",
+            round=rnd,
+            score=score,
+            grade=grade,
+            details=details,
+            content_issues=content_issues,
+            subtitle_mismatches=subtitle_mismatches,
+            suggestions=suggestions,
+            elapsed_s=round(_t.time() - _rnd_t, 1),
+        )
 
         if score > best_review.get("score", 0):
             best_video = video_path
@@ -649,10 +683,12 @@ def run_pipeline(
                 "commentary": cur_commentary,
                 "song": cur_song,
             }
+            trace.event("best_round_updated", round=rnd, score=score, grade=grade)
 
         if score >= 90:
             log("[generate-ai] A级达标，停止迭代", "success")
             log(f"  第{rnd}轮总耗时: {_t.time() - _rnd_t:.1f}s")
+            trace.event("loop_exit", reason="threshold_met", round=rnd, score=score)
             break
 
         if rnd < max_rounds:
@@ -678,6 +714,26 @@ def run_pipeline(
                 author0=author0,
             )
 
+    # ---- 兜底:max_rounds 跑满仍未达 A 级阈值,标 quality_warning ----
+    quality_warning: Optional[str] = None
+    if not cancelled and rounds_log and best_review.get("score", 0) < 90:
+        best_score = best_review.get("score", 0)
+        best_grade = best_review.get("grade", "F")
+        quality_warning = (
+            f"max_rounds={max_rounds} 跑满后最高分仅 {best_score}/{best_grade}; "
+            f"已取最高分版本(第 {best_round['round'] if best_round else '?'} 轮),"
+            f"但未达 A 级阈值(>=90)"
+        )
+        log(f"[generate-ai] [quality_warning] {quality_warning}", "warn")
+        trace.event(
+            "quality_warning",
+            reason="max_rounds_exhausted",
+            best_score=best_score,
+            best_grade=best_grade,
+            best_round=best_round["round"] if best_round else None,
+            all_scores=[r.get("score") for r in rounds_log],
+        )
+
     result = _finalize(
         request_id=request_id,
         agent=agent,
@@ -695,6 +751,7 @@ def run_pipeline(
         cancelled=cancelled,
         logger=log,
         output_dir=output_dir,
+        quality_warning=quality_warning,
     )
 
     _total = _t.time() - _pipeline_start
@@ -702,5 +759,15 @@ def run_pipeline(
         f"[generate-ai] 完成! 最终评分: {result.score}分 ({result.grade}级), "
         f"总耗时: {_total:.1f}s ({_total / 60:.1f}min)",
         "success",
+    )
+    trace.event(
+        "pipeline_end",
+        final_score=result.score,
+        final_grade=result.grade,
+        selected_round=result.selected_round,
+        total_rounds=result.total_rounds,
+        cancelled=result.cancelled,
+        total_elapsed_s=round(_total, 1),
+        final_video=result.final_name,
     )
     return result

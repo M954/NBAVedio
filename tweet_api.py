@@ -605,8 +605,10 @@ def _do_generate_ai_inner(saved_paths, saved_video_path, trans_list, author_list
                           tweet_id=""):
     from agents.pipeline_core import run_pipeline, PipelineResult
     from agents.tweet_video_agent import TweetVideoAgent
+    from agents.trace_logger import TraceLogger
     _log = logger or _vlog
     _agent = TweetVideoAgent()
+    _trace = TraceLogger(tweet_id=tweet_id or request_id)
     result: PipelineResult = run_pipeline(
         saved_paths, trans_list,
         saved_video_path=saved_video_path,
@@ -621,6 +623,7 @@ def _do_generate_ai_inner(saved_paths, saved_video_path, trans_list, author_list
         agent=_agent,
         logger=_log,
         on_cancel=None,
+        trace=_trace,
     )
     return {
         "video_url": f"/video/{result.final_name}",
@@ -628,6 +631,7 @@ def _do_generate_ai_inner(saved_paths, saved_video_path, trans_list, author_list
         "duration": duration,
         "resolution": "1080x1920",
         "images_count": len(saved_paths),
+        "quality_warning": result.quality_warning,
         "ai_enhanced": {
             "original_translation": result.original_translation,
             "polished_translation": result.polished_translations[0] if result.polished_translations else "",

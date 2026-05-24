@@ -1,0 +1,8 @@
+{
+  "namespace": "research_brief.call",
+  "payload": {
+    "prompt": "你在帮一个NBA短视频博主从全网搜索结果里筛选相关内容。\n你的任务【只有筛选 + 一句话总结 + 置信度判断】，不要试图抽取结构化字段，也不要重写事实——硬事实（对手、场次、比分、伤情）下游会直接读原始 snippet。\n\n【时间上下文】今天日期: 2026-05-24\n搜索结果里的日期是真实的，不要因为与你训练数据不符就当成伪造。\n\n原推文（作者: wojespn）:\nBREAKING: Kevin Durant traded to the Lakers per sources.\n\n全网搜索结果（多来源，质量参差）:\n[1] Suns trade Kevin Durant to Lakers in blockbuster deal —— The Phoenix Suns have agreed to trade forward Kevin Durant to the Los Angeles Lakers in exchange for Austin Reaves, Rui Hachimura, and two first-round picks, sources told ESPN.  (ESPN)\n\n请严格输出一个 JSON 对象（不要 markdown 代码块、不要解释），三个字段：\n{\n  \"summary\": \"一句话总结相关搜索结果在讲什么，必须基于原文 snippet，不要复述推文措辞，不要引入 snippet 没说的细节（人物关系、对手球队等）。如果多条 snippet 互相矛盾，写明矛盾点而不是任选一个。20-60字。\",\n  \"relevant_indices\": [挑出与推文最相关的 snippet 编号数组，例 [1,2,5]；宁缺勿滥，不相关的别选；可以为空数组],\n  \"confidence\": \"high (snippet 明确讲推文同一件事) / medium (有相关但不完整) / low (相关度低或互相矛盾)\"\n}\n\n硬规则：\n- 只输出 JSON，不要任何前后文字\n- summary 里不得编造 snippet 中没出现的硬事实（对手球队名、Game几、比分、死因等）\n- relevant_indices 必须是 snippet 真实编号（1..N），不存在的编号不要写\n- 多条 snippet 讲不同事件时，只挑与推文最对得上的那些；矛盾就在 summary 里点出来\n- 不确定就给 medium 或 low，不要硬给 high\n",
+    "system": "你是一个严谨的检索结果筛选器，只输出合法 JSON。"
+  },
+  "result": "{\"summary\":\"ESPN报道太阳将Kevin Durant交易至湖人，换回Austin Reaves、Rui Hachimura及两个首轮签。\",\"relevant_indices\":[1],\"confidence\":\"high\"}"
+}
