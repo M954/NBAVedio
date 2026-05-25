@@ -213,6 +213,11 @@ class VoiceActor:
             wav_file.writeframes(silence_frame * n_frames)
 
     def synthesize_segment(self, text, filename, version=1, retries=3):
+        if os.environ.get("NBAVEDIO_E2E_STUB") == "1":
+            # E2E stub: emit silent wav instead of calling Edge/Azure TTS
+            wav_path = os.path.join(self.output_dir, filename).replace(".mp3", ".wav")
+            self._generate_silent_wav(wav_path, duration_sec=2)
+            return wav_path
         rate = "+0%"
         volume = "+0%"
         pitch = "+0Hz"

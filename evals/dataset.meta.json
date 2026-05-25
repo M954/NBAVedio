@@ -1,0 +1,10 @@
+{
+  "target": "needs_research",
+  "annotator": "project-author",
+  "annotated_at": "2026-05-25",
+  "sampling_strategy": "hand-picked to cover reaction / condolence / breaking-news / self-explanatory / injection-probe categories; enriched for known failure modes",
+  "class_balance_note": "11 True / 5 False (16 cases total)",
+  "known_bias": "single annotator, same person tuned the pipeline being evaluated",
+  "inter_annotator_agreement": null,
+  "categories": ["reaction", "condolence", "breaking_news", "self_explanatory", "injection_probe"]
+}

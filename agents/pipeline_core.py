@@ -21,7 +21,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from .trace_logger import NullTrace, TraceLogger  # noqa: F401  re-export for callers
+from .trace_logger import NullTrace, TraceLogger, set_current as _set_current_trace  # noqa: F401  re-export for callers
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +359,8 @@ def run_pipeline(
 
     log = logger or _default_logger
     trace = trace or NullTrace()
+    # 注册为"当前 trace",让深层 LLM/SerpAPI 调用不必把 trace 一路 thread 下去
+    _set_current_trace(trace)
     if not request_id:
         request_id = uuid.uuid4().hex[:8]
 
@@ -663,6 +665,19 @@ def run_pipeline(
             "song": cur_song,
             "suggestions": suggestions,
         })
+        ja = review.get("judge_agreement")
+        if isinstance(ja, dict):
+            trace.event(
+                "judge_agreement",
+                round=rnd,
+                content_issues_jaccard=ja.get("content_issues_jaccard"),
+                grade_match=ja.get("grade_match"),
+                score_delta=ja.get("score_delta"),
+                gemini_grade=ja.get("gemini_grade"),
+                claude_grade=ja.get("claude_grade"),
+                gemini_score=ja.get("gemini_score"),
+                claude_score=ja.get("claude_score"),
+            )
         trace.event(
             "round_end",
             round=rnd,
@@ -770,4 +785,5 @@ def run_pipeline(
         total_elapsed_s=round(_total, 1),
         final_video=result.final_name,
     )
+    _set_current_trace(None)
     return result

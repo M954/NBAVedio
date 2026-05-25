@@ -11,7 +11,67 @@ import json
 import os
 import re
 import subprocess
+import time as _time
 import urllib.request
+
+from agents.trace_logger import estimate_tokens, get_current as _get_trace
+from agents.prompt_safety import wrap_untrusted, UNTRUSTED_SYSTEM_CLAUSE
+
+# E2E STUB MODE: NBAVEDIO_E2E_STUB=1 bypasses all external LLM/SerpAPI/TTS/ffmpeg calls,
+# captures prompts to output/traces/{tid}_prompts.jsonl, still fires real trace events
+# (P1 judge_agreement + P4 llm_call) so the fullstack e2e can assert on artifacts.
+_E2E_STUB = os.environ.get("NBAVEDIO_E2E_STUB") == "1"
+
+
+def _e2e_log_prompt(purpose: str, system: str, prompt: str, model: str = "") -> None:
+    """Append a prompt that WOULD have been sent to an LLM to {tid}_prompts.jsonl."""
+    if not _E2E_STUB:
+        return
+    try:
+        tr = _get_trace()
+        tid = getattr(tr, "tweet_id", "") or "anon"
+        base = os.path.join(os.path.dirname(getattr(tr, "path", "")) or "output/traces", "")
+        if not base or base == "/":
+            base = os.path.join("output", "traces")
+        os.makedirs(base, exist_ok=True)
+        path = os.path.join(base, f"{tid}_prompts.jsonl")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "purpose": purpose,
+                "model": model,
+                "system": str(system or ""),
+                "prompt": str(prompt or ""),
+            }, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _e2e_synth_response(purpose: str, *, judge: str = "") -> str:
+    """Return a plausible synthetic LLM response for a given purpose.
+    judge='gemini'/'claude' controls slight divergence so P1 jaccard < 1.0."""
+    if purpose in ("review_video", "review_video_merge", "analyze_video_gemini", "analyze_video_claude_frames"):
+        issues = ["pacing"] if judge != "claude" else ["pacing", "music"]
+        return json.dumps({
+            "score": 72 if judge != "claude" else 70,
+            "grade": "C",
+            "details": {"内容准确性": 18, "解说风格": 16, "配乐质量": 10, "配音效果": 10, "视觉效果": 8, "内容趣味": 10},
+            "subtitle_mismatches": [],
+            "content_issues": issues,
+            "suggestions": ["收紧节奏", "口语化"],
+        }, ensure_ascii=False)
+    if purpose in ("polish_translation",):
+        return "勒布朗今日发推，状态拉满。"
+    if purpose in ("generate_commentary",):
+        return "勒布朗今日发推，状态真的拉满，老詹这一波必须给。"
+    if purpose in ("recommend_music_claude", "recommend_music", "music_recommend"):
+        return "Lose Yourself - Eminem"
+    if purpose in ("mood",):
+        return "hype"
+    if purpose == "needs_research":
+        return '{"need": false, "query": ""}'
+    if purpose == "merge_video_analysis":
+        return "画面单调但解说尚可。"
+    return "OK"
 
 
 def _truncate(text, limit):
@@ -22,6 +82,92 @@ def _truncate(text, limit):
     if len(s) <= limit:
         return s
     return s[:limit] + f"...[+{len(s) - limit}字省略]"
+
+
+def _parse_judge_payload(raw):
+    """Try to parse a judge's raw response as JSON; fallback to raw string."""
+    if not raw:
+        return None
+    s = str(raw).strip()
+    if s.startswith("```"):
+        s = s.split("\n", 1)[-1] if "\n" in s else s[3:]
+        if s.endswith("```"):
+            s = s[:-3]
+        s = s.strip()
+    try:
+        return json.loads(s)
+    except (json.JSONDecodeError, ValueError):
+        m = re.search(r"\{.*\}", s, re.S)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return raw
+
+
+def _issues_set(parsed):
+    if not isinstance(parsed, dict):
+        return None
+    items = parsed.get("content_issues")
+    if items is None:
+        return None
+    if not isinstance(items, list):
+        return None
+    return {str(x).strip().lower() for x in items if str(x).strip()}
+
+
+def _judge_grade(parsed):
+    if isinstance(parsed, dict):
+        g = parsed.get("grade")
+        if isinstance(g, str) and g.strip():
+            return g.strip().upper()
+    return None
+
+
+def _judge_score(parsed):
+    if isinstance(parsed, dict):
+        s = parsed.get("score")
+        if isinstance(s, (int, float)):
+            return float(s)
+    return None
+
+
+def _compute_judge_agreement(gemini_parsed, claude_parsed):
+    g_set = _issues_set(gemini_parsed)
+    c_set = _issues_set(claude_parsed)
+    if g_set is None and c_set is None:
+        # Neither judge reported a content_issues field → no disagreement signal available;
+        # treat as full agreement per spec.
+        jaccard = 1.0
+    elif g_set is None or c_set is None:
+        jaccard = None
+    elif not g_set and not c_set:
+        jaccard = 1.0
+    elif not g_set or not c_set:
+        jaccard = 0.0
+    else:
+        inter = len(g_set & c_set)
+        union = len(g_set | c_set)
+        jaccard = inter / union if union else 1.0
+
+    g_grade = _judge_grade(gemini_parsed)
+    c_grade = _judge_grade(claude_parsed)
+    grade_match = (g_grade == c_grade) if (g_grade and c_grade) else None
+
+    g_score = _judge_score(gemini_parsed)
+    c_score = _judge_score(claude_parsed)
+    score_delta = abs(g_score - c_score) if (g_score is not None and c_score is not None) else None
+
+    return {
+        "content_issues_jaccard": jaccard,
+        "grade_match": grade_match,
+        "score_delta": score_delta,
+        "gemini_grade": g_grade,
+        "claude_grade": c_grade,
+        "gemini_score": g_score,
+        "claude_score": c_score,
+    }
 
 
 class _BaseAssistant:
@@ -36,7 +182,7 @@ class _BaseAssistant:
         else:
             print(f"  [AI] [{level}] {msg}")
 
-    def _call(self, prompt, system="你是一个专业的NBA篮球内容编辑和翻译。"):
+    def _call(self, prompt, system="你是一个专业的NBA篮球内容编辑和翻译。", purpose="unknown"):
         raise NotImplementedError
 
     # ── Gemini 视频直传分析 ──────────────────────────────────
@@ -48,6 +194,19 @@ class _BaseAssistant:
     @staticmethod
     def _analyze_video_gemini(video_path, prompt):
         """用 Gemini 直传视频文件进行分析，返回文本结果。"""
+        if _E2E_STUB:
+            _e2e_log_prompt("analyze_video_gemini", "", prompt, model=_BaseAssistant._GEMINI_MODEL)
+            result = _e2e_synth_response("analyze_video_gemini", judge="gemini")
+            _tr = _get_trace()
+            if _tr is not None:
+                _tr.llm_call(
+                    model=_BaseAssistant._GEMINI_MODEL,
+                    purpose="analyze_video_gemini",
+                    latency_ms=0.0,
+                    tokens_in_est=estimate_tokens(prompt),
+                    tokens_out_est=estimate_tokens(result),
+                )
+            return result
         api_key = os.environ.get("GEMINI_API_KEY", "") or _BaseAssistant._GEMINI_API_KEY
         if not api_key:
             print("  [Gemini] 未设置 GEMINI_API_KEY，跳过")
@@ -79,8 +238,26 @@ class _BaseAssistant:
                         if "text" in p:
                             result = p["text"].strip()
                             print(f"  [Gemini] 分析完成，耗时 {elapsed:.1f}s，结果长度: {len(result)} 字符")
+                            _tr = _get_trace()
+                            if _tr is not None:
+                                _tr.llm_call(
+                                    model=model,
+                                    purpose="analyze_video_gemini",
+                                    latency_ms=elapsed * 1000.0,
+                                    tokens_in_est=estimate_tokens(prompt) + int(file_size_mb * 256),
+                                    tokens_out_est=estimate_tokens(result),
+                                )
                             return result
                 print(f"  [Gemini] 返回无文本内容，耗时 {elapsed:.1f}s")
+                _tr = _get_trace()
+                if _tr is not None:
+                    _tr.llm_call(
+                        model=model,
+                        purpose="analyze_video_gemini",
+                        latency_ms=elapsed * 1000.0,
+                        tokens_in_est=estimate_tokens(prompt) + int(file_size_mb * 256),
+                        tokens_out_est=0,
+                    )
                 return ""
             except urllib.error.HTTPError as e:
                 elapsed = _t.time() - _start
@@ -340,6 +517,19 @@ class _BaseAssistant:
     def _call_claude_vision(prompt, frames_b64, audio_b64="", max_tokens=800):
         """单次 Claude 视觉请求：发送给定的若干帧（+ 可选音频）。
         音频 type 字段必须是 "audio"（不是 "input_audio"，那是 OpenAI schema）。"""
+        if _E2E_STUB:
+            _e2e_log_prompt("analyze_video_claude_frames", "", prompt, model=_BaseAssistant._CLAUDE_VISION_MODEL)
+            result_text = _e2e_synth_response("analyze_video_claude_frames", judge="claude")
+            _tr = _get_trace()
+            if _tr is not None:
+                _tr.llm_call(
+                    model=_BaseAssistant._CLAUDE_VISION_MODEL,
+                    purpose="analyze_video_claude_frames",
+                    latency_ms=0.0,
+                    tokens_in_est=estimate_tokens(prompt) + 1500 * len(frames_b64),
+                    tokens_out_est=estimate_tokens(result_text),
+                )
+            return result_text
         content = [{"type": "text", "text": prompt}]
         for b64 in frames_b64:
             content.append({
@@ -365,12 +555,24 @@ class _BaseAssistant:
                 method="POST",
             )
             try:
+                _t0 = _t.perf_counter()
                 with urllib.request.urlopen(req, timeout=120) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
+                result_text = ""
                 for block in data.get("content", []):
                     if block.get("type") == "text":
-                        return block["text"].strip()
-                return ""
+                        result_text = block["text"].strip()
+                        break
+                _tr = _get_trace()
+                if _tr is not None:
+                    _tr.llm_call(
+                        model=_BaseAssistant._CLAUDE_VISION_MODEL,
+                        purpose="analyze_video_claude_frames",
+                        latency_ms=(_t.perf_counter() - _t0) * 1000.0,
+                        tokens_in_est=estimate_tokens(prompt) + 1500 * len(frames_b64),  # ~1500 tok/frame heuristic
+                        tokens_out_est=estimate_tokens(result_text),
+                    )
+                return result_text
             except urllib.error.HTTPError as e:
                 err_body = ""
                 try:
@@ -396,6 +598,8 @@ class _BaseAssistant:
     @staticmethod
     def _analyze_video_claude_frames(video_path, prompt, frame_times=None):
         """抽帧 + Whisper 转写 + Claude 音乐氛围；图像每 2 帧一批，最后合并。"""
+        if _E2E_STUB:
+            return _BaseAssistant._call_claude_vision(prompt, ["stub_frame_b64"], "")
         import time as _t
         _start = _t.time()
         n_frames = len(frame_times) if frame_times else 8
@@ -416,7 +620,7 @@ class _BaseAssistant:
         partials = []
 
         if transcript:
-            partials.append(f"[音频转写 (Whisper)]\n{transcript}")
+            partials.append(f"[音频转写 (Whisper)]\n{wrap_untrusted(transcript, 'transcript')}")
 
         # 3) 图像批：每批 2 帧，纯图像
         for i in range(0, total, batch_size):
@@ -478,7 +682,7 @@ class _BaseAssistant:
             f"原文: {original_text}\n"
             f"当前翻译: {raw_translation}"
         )
-        result = self._call(prompt)
+        result = self._call(prompt, purpose="polish_translation")
         return result.strip().strip('"').strip("'") if result else raw_translation
 
     def analyze_video_content(self, video_path, original_text="", author="", want_trim_plan=False, max_trim_total=50.0):
@@ -491,7 +695,10 @@ class _BaseAssistant:
         """
         import concurrent.futures
 
-        ref_info = f"参考信息 — 作者: {author}，推文原文: {original_text}" if (author or original_text) else ""
+        ref_info = (
+            f"参考信息 — 作者:\n{wrap_untrusted(author, 'author')}\n"
+            f"推文原文:\n{wrap_untrusted(original_text, 'tweet')}"
+        ) if (author or original_text) else ""
 
         if want_trim_plan:
             gemini_prompt = (
@@ -605,7 +812,7 @@ class _BaseAssistant:
                 f"{ref_info}"
             )
             try:
-                merged = self._call(summary_prompt)
+                merged = self._call(summary_prompt, purpose="merge_video_analysis")
                 if merged and merged.strip():
                     self._log(f"[视频分析-summary raw]\n{merged.strip()}")
                     description = merged.strip()
@@ -668,7 +875,7 @@ class _BaseAssistant:
                 "结合视频内容描述，语气更有现场感。\n"
             )
             if video_description:
-                video_hint += f"视频内容分析：{video_description}\n"
+                video_hint += f"视频内容分析：\n{wrap_untrusted(video_description, 'video_description')}\n"
 
         # 根据视频时长计算目标字数（中文 TTS 约 4 字/秒，预留首尾各 1.5s）
         if target_duration > 0:
@@ -718,12 +925,12 @@ class _BaseAssistant:
             f"   表外球员一律采用国内主流篮球媒体（如腾讯体育/虎扑）通用音译，"
             f"绝不可凭感觉造名（例如不得把Wembanyama叫'华师'）。如不确定，宁可用全名音译也不要生造昵称。\n"
             f"{video_hint}\n"
-            f"球星: {author}{nickname_hint}\n"
-            f"原文: {original_text}\n"
-            f"翻译: {translation}\n\n"
+            f"球星:\n{wrap_untrusted(author, 'author')}{nickname_hint}\n"
+            f"原文:\n{wrap_untrusted(original_text, 'tweet')}\n"
+            f"翻译:\n{wrap_untrusted(translation, 'tweet')}\n\n"
             + (
                 "【背景资料（由检索筛选得到：一句话摘要 + 相关原文 snippet）】\n"
-                f"{context_brief}\n\n"
+                f"{wrap_untrusted(context_brief, 'search_result')}\n\n"
                 "对背景资料的使用规则（强制）：\n"
                 "- **硬事实只能用原文 snippet 里出现过的字面信息**：对手球队、Game几、"
                 "系列赛比分、具体分数、伤情、城市、日期。snippet 里没有就不要写——"
@@ -741,7 +948,11 @@ class _BaseAssistant:
             ) +
             f"再次提醒：返回前在心里默念一遍解说词，确认【完整、顺口、能让人听懂】才提交。"
         )
-        result = self._call(prompt)
+        result = self._call(
+            prompt,
+            system=UNTRUSTED_SYSTEM_CLAUSE + "\n\n你是一个专业的NBA篮球内容编辑和翻译。",
+            purpose="generate_commentary",
+        )
         if result:
             # 后处理：修复空格分隔的问题，确保标点规范
             text = result.strip().strip('"').strip("'")
@@ -800,7 +1011,7 @@ class _BaseAssistant:
             video_block = (
                 "推文带视频，下面是视频内容分析（如果视频已经把事件/人物讲清楚，"
                 "不需要再搜索）：\n"
-                f"{_truncate(video_description, 800)}\n\n"
+                f"{wrap_untrusted(_truncate(video_description, 800), 'video_description')}\n\n"
             )
         prompt = (
             "你在判断一条NBA推文是否需要去全网搜索背景，才能写出准确的中文解说词。\n"
@@ -817,11 +1028,17 @@ class _BaseAssistant:
             "若 need=true 且推文是评价类，query 应聚焦被评价对象的近期比赛"
             "（例：\"Victor Wembanyama game stats tonight\"）。\n"
             "不要解释、不要多余文字。\n\n"
-            f"作者: {author}\n原文: {original_text}\n翻译: {translation}\n"
+            f"作者:\n{wrap_untrusted(author, 'author')}\n"
+            f"原文:\n{wrap_untrusted(original_text, 'tweet')}\n"
+            f"翻译:\n{wrap_untrusted(translation, 'tweet')}\n"
             f"{video_block}"
         )
         try:
-            raw = self._call(prompt) or ""
+            raw = self._call(
+                prompt,
+                system=UNTRUSTED_SYSTEM_CLAUSE + "\n\n你是一个专业的NBA篮球内容编辑和翻译。",
+                purpose="needs_research",
+            ) or ""
             m = re.search(r"\{.*\}", raw, re.S)
             if not m:
                 need_llm, query_llm = False, ""
@@ -1009,10 +1226,10 @@ class _BaseAssistant:
                 f"{dimension_rules}"
                 f"=== 预期内容 ===\n"
                 f"解说词: {video_info.get('commentary', '')}\n"
-                f"推文原文: {video_info.get('original_text', '')}\n"
-                f"翻译: {video_info.get('translation', '')}\n"
-                f"作者: {video_info.get('author', '')}\n"
-                f"视频内容分析: {video_info.get('video_description', '')}\n\n"
+                f"推文原文:\n{wrap_untrusted(video_info.get('original_text', ''), 'tweet')}\n"
+                f"翻译:\n{wrap_untrusted(video_info.get('translation', ''), 'tweet')}\n"
+                f"作者:\n{wrap_untrusted(video_info.get('author', ''), 'author')}\n"
+                f"视频内容分析:\n{wrap_untrusted(video_info.get('video_description', ''), 'video_description')}\n\n"
                 f"请严格评估：\n"
                 f"1. 内容准确性【最重要】：解说词是否忠实于推文原文的事实？有无添油加醋、张冠李戴、编造细节？\n"
                 f"2. 视频匹配度：如果有原始推文视频，解说词是否与视频画面内容一致？有无描述了视频中不存在的内容？\n"
@@ -1039,9 +1256,9 @@ class _BaseAssistant:
                     f"{dimension_rules}"
                     f"=== 预期内容 ===\n"
                     f"解说词: {video_info.get('commentary', '')}\n"
-                    f"推文原文: {video_info.get('original_text', '')}\n"
-                    f"翻译: {video_info.get('translation', '')}\n"
-                    f"作者: {video_info.get('author', '')}\n\n"
+                    f"推文原文:\n{wrap_untrusted(video_info.get('original_text', ''), 'tweet')}\n"
+                    f"翻译:\n{wrap_untrusted(video_info.get('translation', ''), 'tweet')}\n"
+                    f"作者:\n{wrap_untrusted(video_info.get('author', ''), 'author')}\n\n"
                     f"=== 字幕校对清单 ===\n{checklist}\n\n"
                     f"请完成两项任务：\n\n"
                     f"【任务1: 字幕校对】\n"
@@ -1087,6 +1304,14 @@ class _BaseAssistant:
             else:
                 video_analysis = gemini_result or claude_result
 
+            gemini_parsed = _parse_judge_payload(gemini_result)
+            claude_parsed = _parse_judge_payload(claude_result)
+            judge_agreement = _compute_judge_agreement(gemini_parsed, claude_parsed)
+        else:
+            gemini_parsed = None
+            claude_parsed = None
+            judge_agreement = None
+
         # 加载风格参考
         try:
             from .style_guide import STYLE_EXAMPLES, FORBIDDEN_WORDS
@@ -1102,7 +1327,7 @@ class _BaseAssistant:
             f"=== 视频元信息 ===\n"
             f"解说词: {video_info.get('commentary', '')}\n"
             f"翻译文本: {video_info.get('translation', '')}\n"
-            f"作者: {video_info.get('author', '')}\n"
+            f"作者:\n{wrap_untrusted(video_info.get('author', ''), 'author')}\n"
             f"背景音乐: {video_info.get('bgm_song', '合成音乐')}\n"
             f"配乐氛围: {video_info.get('mood', '')}\n"
             f"有配音: {video_info.get('has_narration', False)}\n"
@@ -1149,7 +1374,7 @@ class _BaseAssistant:
         )
 
         # 最终评分 agent 也抽 8 帧+音频看视频；audio 用 Whisper 转写
-        if video_path and os.path.exists(video_path):
+        if video_path and os.path.exists(video_path) and not _E2E_STUB:
             frames = self._extract_frames_b64(video_path, n=8)
             lang, segs = self._transcribe_audio(video_path)
             transcript = self._format_transcript(lang, segs)
@@ -1158,7 +1383,7 @@ class _BaseAssistant:
             partials = []
 
             if transcript:
-                partials.append(f"[音频转写 (Whisper)]\n{transcript}")
+                partials.append(f"[音频转写 (Whisper)]\n{wrap_untrusted(transcript, 'transcript')}")
 
             for i in range(0, len(frames), batch_size):
                 batch_frames = frames[i:i + batch_size]
@@ -1176,7 +1401,7 @@ class _BaseAssistant:
                         self._log(f"[Review-Claude图像批{batch_idx} raw]\n{_truncate(part, 200)}")
                 except Exception as _e:
                     self._log(f"[Review-Claude图像批{batch_idx}] 失败: {type(_e).__name__}: {_e}", "warn")
-            system_msg = "你是专业短视频审阅员。必须以纯JSON格式返回结果，不要包含markdown代码块标记。评分要严格，不要给人情分。"
+            system_msg = UNTRUSTED_SYSTEM_CLAUSE + "\n\n" + "你是专业短视频审阅员。必须以纯JSON格式返回结果，不要包含markdown代码块标记。评分要严格，不要给人情分。"
             if partials:
                 merge_prompt = (
                     prompt
@@ -1184,12 +1409,12 @@ class _BaseAssistant:
                     + "\n\n".join(partials)
                     + "\n\n请综合上述观察按要求 JSON 格式输出最终评分结果。"
                 )
-                result = self._call(merge_prompt, system=system_msg)
+                result = self._call(merge_prompt, system=system_msg, purpose="review_video_merge")
             else:
-                result = self._call(prompt, system=system_msg)
+                result = self._call(prompt, system=system_msg, purpose="review_video")
         else:
-            system_msg = "你是专业短视频审阅员。必须以纯JSON格式返回结果，不要包含markdown代码块标记。评分要严格，不要给人情分。"
-            result = self._call(prompt, system=system_msg)
+            system_msg = UNTRUSTED_SYSTEM_CLAUSE + "\n\n" + "你是专业短视频审阅员。必须以纯JSON格式返回结果，不要包含markdown代码块标记。评分要严格，不要给人情分。"
+            result = self._call(prompt, system=system_msg, purpose="review_video")
 
         self._log(f"[Review-最终评分 raw]\n{result}")
 
@@ -1211,15 +1436,28 @@ class _BaseAssistant:
                 review["grade"] = "C"
             else:
                 review["grade"] = "D"
+            if gemini_parsed is not None:
+                review["gemini_raw_review"] = gemini_parsed
+            if claude_parsed is not None:
+                review["claude_raw_review"] = claude_parsed
+            if judge_agreement is not None:
+                review["judge_agreement"] = judge_agreement
             return review
         except (json.JSONDecodeError, ValueError):
-            return {
+            fallback = {
                 "score": 0,
                 "grade": "F",
                 "details": {},
                 "suggestions": ["AI审阅解析失败，请重试"],
                 "raw": result,
             }
+            if gemini_parsed is not None:
+                fallback["gemini_raw_review"] = gemini_parsed
+            if claude_parsed is not None:
+                fallback["claude_raw_review"] = claude_parsed
+            if judge_agreement is not None:
+                fallback["judge_agreement"] = judge_agreement
+            return fallback
 
 
 class ClaudeAssistant(_BaseAssistant):
@@ -1235,7 +1473,18 @@ class ClaudeAssistant(_BaseAssistant):
         self._model = self.CLAUDE_MODEL
         self._log(f"Claude API 端点: {self._endpoint}")
 
-    def _call(self, prompt, system="你是一个专业的NBA篮球内容编辑和翻译。"):
+    def _call(self, prompt, system="你是一个专业的NBA篮球内容编辑和翻译。", purpose="unknown"):
+        if _E2E_STUB:
+            _e2e_log_prompt(purpose, system, prompt, model=self._model)
+            result_text = _e2e_synth_response(purpose)
+            _tr = _get_trace()
+            if _tr is not None:
+                _tr.llm_call(
+                    model=self._model, purpose=purpose, latency_ms=0.0,
+                    tokens_in_est=estimate_tokens(system) + estimate_tokens(prompt),
+                    tokens_out_est=estimate_tokens(result_text),
+                )
+            return result_text
         body = json.dumps({
             "model": self._model,
             "max_tokens": 1024,
@@ -1243,6 +1492,8 @@ class ClaudeAssistant(_BaseAssistant):
             "messages": [{"role": "user", "content": prompt}],
         }).encode("utf-8")
 
+        _t0 = _time.perf_counter()
+        result_text = ""
         for attempt in range(3):
             req = urllib.request.Request(
                 self._endpoint,
@@ -1258,16 +1509,28 @@ class ClaudeAssistant(_BaseAssistant):
                     data = json.loads(resp.read().decode("utf-8"))
                 for block in data.get("content", []):
                     if block.get("type") == "text":
-                        return block["text"].strip()
-                return ""
+                        result_text = block["text"].strip()
+                        break
+                break
             except Exception as e:
                 wait = (attempt + 1) * 10  # 10s, 20s, 30s
                 self._log(f"Claude API 尝试{attempt+1}/3 失败: {e}，{wait}s 后重试", "warn")
                 if attempt < 2:
                     import time
                     time.sleep(wait)
-        self._log("Claude API 3次尝试均失败", "error")
-        return ""
+        else:
+            self._log("Claude API 3次尝试均失败", "error")
+
+        _tr = _get_trace()
+        if _tr is not None:
+            _tr.llm_call(
+                model=self._model,
+                purpose=purpose,
+                latency_ms=(_time.perf_counter() - _t0) * 1000.0,
+                tokens_in_est=estimate_tokens(system) + estimate_tokens(prompt),
+                tokens_out_est=estimate_tokens(result_text),
+            )
+        return result_text
 
 
 class GptAssistant(_BaseAssistant):
@@ -1281,13 +1544,24 @@ class GptAssistant(_BaseAssistant):
         self.api_version = os.environ.get("AZURE_OPENAI_API_VERSION", "2025-04-01-preview")
         self.api_key = os.environ.get("AZURE_OPENAI_API_KEY", "")
         self.model = os.environ.get("AZURE_OPENAI_MODEL", "gpt-5.4-mini")
-        if not self.api_key:
+        if not self.api_key and not _E2E_STUB:
             raise RuntimeError(
                 "请设置环境变量 AZURE_OPENAI_API_KEY，例如：\n"
                 "  $env:AZURE_OPENAI_API_KEY = 'your-key-here'"
             )
 
-    def _call(self, prompt, system="你是一个专业的NBA篮球内容编辑和翻译。"):
+    def _call(self, prompt, system="你是一个专业的NBA篮球内容编辑和翻译。", purpose="unknown"):
+        if _E2E_STUB:
+            _e2e_log_prompt(purpose, system, prompt, model=self.model)
+            result_text = _e2e_synth_response(purpose)
+            _tr = _get_trace()
+            if _tr is not None:
+                _tr.llm_call(
+                    model=self.model, purpose=purpose, latency_ms=0.0,
+                    tokens_in_est=estimate_tokens(system) + estimate_tokens(prompt),
+                    tokens_out_est=estimate_tokens(result_text),
+                )
+            return result_text
         url = f"{self.endpoint}?api-version={self.api_version}"
         body = json.dumps({
             "model": self.model,
@@ -1306,16 +1580,28 @@ class GptAssistant(_BaseAssistant):
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-
-        output = data.get("output", [])
-        for item in output:
-            if item.get("type") == "message":
-                for c in item.get("content", []):
-                    if c.get("type") == "output_text":
-                        return c["text"]
-        return ""
+        _t0 = _time.perf_counter()
+        result_text = ""
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            for item in data.get("output", []):
+                if item.get("type") == "message":
+                    for c in item.get("content", []):
+                        if c.get("type") == "output_text":
+                            result_text = c["text"]
+                            break
+        finally:
+            _tr = _get_trace()
+            if _tr is not None:
+                _tr.llm_call(
+                    model=self.model,
+                    purpose=purpose,
+                    latency_ms=(_time.perf_counter() - _t0) * 1000.0,
+                    tokens_in_est=estimate_tokens(system) + estimate_tokens(prompt),
+                    tokens_out_est=estimate_tokens(result_text),
+                )
+        return result_text
 
 
 # ── 工厂函数 ──────────────────────────────────────────────

@@ -438,6 +438,26 @@ class TweetVideoAgent:
                  duration=12.0, output_name=None, commentary=None,
                  song_query=None, source_video=None, video_subtitles=None,
                  highlight_segments=None):
+        if os.environ.get("NBAVEDIO_E2E_STUB") == "1":
+            # E2E stub: skip real composition; copy a pre-existing tiny mp4 as the output
+            # so downstream _collect_video_info / file size checks still pass.
+            import glob, shutil as _sh
+            if not output_name:
+                output_name = f"tweet_{uuid.uuid4().hex[:8]}.mp4"
+            out_path = os.path.join(self.output_dir, output_name)
+            # find any existing mp4 in output_dir to use as a valid dummy
+            candidates = [p for p in glob.glob(os.path.join(self.output_dir, "tweet_*.mp4"))
+                          if "_v" not in os.path.basename(p) and os.path.basename(p) != output_name]
+            if not candidates:
+                # create a minimal valid mp4 via moviepy ColorClip
+                from moviepy import ColorClip
+                clip = ColorClip(size=(108, 192), color=(0, 0, 0), duration=1.0)
+                clip.fps = 24
+                clip.write_videofile(out_path, codec="libx264", audio=False, logger=None)
+            else:
+                _sh.copyfile(candidates[0], out_path)
+            self.last_subtitle_timeline = [(t, i * 1.0, 1.0) for i, t in enumerate(translations[:3])] or [("stub", 0.0, 1.0)]
+            return out_path
         """
         生成推特短视频（逐句字幕版）
         

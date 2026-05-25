@@ -78,6 +78,58 @@ class TraceLogger:
             # 不让 trace 失败影响 pipeline;静默丢这一条
             pass
 
+    def llm_call(
+        self,
+        *,
+        model: str,
+        purpose: str,
+        latency_ms: float,
+        tokens_in_est: int,
+        tokens_out_est: int,
+        cache_hit: bool = False,
+        **extra: Any,
+    ) -> None:
+        # tokens_in/out 用 len(text)//4 启发式估算,不引入 tokenizer 依赖。
+        self.event(
+            "llm_call",
+            model=model,
+            purpose=purpose,
+            latency_ms=round(float(latency_ms), 2),
+            tokens_in_est=int(tokens_in_est),
+            tokens_out_est=int(tokens_out_est),
+            cache_hit=bool(cache_hit),
+            **extra,
+        )
+
     def close(self) -> None:
         # 占位:目前每行立即 flush,close 无必要。保留接口避免调用方记不住。
         pass
+
+
+# 让 NullTrace 也支持 llm_call,免得调用点要判类型
+def _null_llm_call(self, **_kw: Any) -> None:
+    pass
+
+
+NullTrace.llm_call = _null_llm_call  # type: ignore[attr-defined]
+
+
+# 模块级"当前 trace" — pipeline 在入口 set_current(trace),深层 LLM 调用
+# 不必把 trace 一路 thread 下去。pipeline 退出时调用 set_current(None) 复位。
+_CURRENT_TRACE: "NullTrace | None" = None
+
+
+def set_current(trace: "NullTrace | None") -> None:
+    global _CURRENT_TRACE
+    _CURRENT_TRACE = trace
+
+
+def get_current() -> "NullTrace | None":
+    return _CURRENT_TRACE
+
+
+def estimate_tokens(text: Any) -> int:
+    # len // 4 启发式;真实 tokenizer 留给 eval 离线脚本做精确化
+    if not text:
+        return 1
+    return max(1, len(str(text)) // 4)

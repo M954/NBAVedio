@@ -38,3 +38,6 @@ Thumbs.db
 
 # Test artifacts
 test_tts_*.mp3
+
+# Eval per-case results (auto-generated, not for VCS)
+evals/results/

@@ -1,35 +1,51 @@
-# Eval Framework
+# NBAVedio Eval Targets
 
-Hand-labeled regression tests for the LLM agents. **Strict cache: paid APIs never re-billed in CI.**
+Two eval targets guard the highest-hallucination-risk steps in the pipeline.
 
-## Why
+## Targets
 
-We hit the same module 3+ times debugging Bug B. That's the signal to stop manual debugging and build eval (see `LESSONS_LEARNED.md` §"When to Stop and Build Eval"). Every future prompt/heuristic change runs against this dataset before being declared a win.
+| Target | Cases | Tests | Baseline | Run |
+|---|---|---|---|---|
+| `needs_research` | 16 | needs_research decision F1 | F1 ≈ 0.857 | `python -m evals.run_needs_research` |
+| `research_brief` | 6 | brief faithfulness to SerpAPI snippets | pass-rate vs empty-brief baseline | `python -m evals.run_research_brief` |
 
-## Layout
+## Label provenance
 
-```
-evals/
-├── dataset.jsonl              # ground-truth cases (15 seeded, append as bugs surface)
-├── _cache.py                  # strict on-disk cache; cache miss = error by default
-├── cache/                     # cached LLM call results (commit to repo)
-├── run_needs_research.py      # eval: should_research decision accuracy
-└── run_extract_facts.py       # eval: research brief quality (TODO)
-```
+- **Annotator**: single annotator (project author). No inter-annotator agreement measured. Known bias risk: labels and pipeline tuned by the same person.
+- **Sampling strategy for needs_research**: cases collected from real tweets ingested by the sibling NBACrawler project, hand-picked to cover:
+  - reaction tweets (GOAT / he's him / alien / 外星人)
+  - condolence tweets (RIP X)
+  - breaking news (trades, injuries)
+  - tweets that are self-explanatory and should NOT trigger research
+  - one injection-probe case (P5)
 
-## Workflow
+  Not a uniform sample — deliberately enriched for known failure modes.
+- **Sampling strategy for research_brief**: cases hand-picked to exercise must_mention (key facts must appear), must_not_mention (no hallucinated opponents / scores), and min_confidence (downgrade rules from P3, including the `single_source_downgrade` case).
+- **Status**: regression set, not a statistical sample. Confidence intervals on F1 would be meaningless at this N.
+
+## What baselines mean
+
+Each run prints trivial baselines alongside the model metric:
+- `needs_research`: always_true / always_false / random(seed=42)
+- `research_brief`: empty brief (no facts, confidence=low)
+
+A model whose F1 / pass-rate doesn't beat the strongest trivial baseline is doing nothing.
+
+## Persistence
+
+Per-case results are written to `evals/results/<target>_<YYYYMMDD_HHMMSS>.jsonl` with a `_meta` first line (target, timestamp, metrics, baselines, git commit if available). Results dir is gitignored.
+
+## Cache workflow (strict, paid APIs never re-billed in CI)
 
 ```bash
-cd NBAVedio
-
-# 1. Record baseline (one-time, costs API quota)
+# 1. Record baseline once — allows live LLM calls, writes results into cache/
 python -m evals.run_needs_research --record
 
-# 2. After any prompt/heuristic change → cache-only run, no API spend
+# 2. After any prompt/heuristic change → cache-only run, zero API spend
 python -m evals.run_needs_research
 ```
 
-`--record` allows live LLM calls and writes results to `cache/`. Without it, a cache miss raises — so CI never silently burns quota.
+Without `--record`, a cache miss raises an error. CI never silently burns quota.
 
 ## Adding a case
 
@@ -42,6 +58,11 @@ python -m evals.run_needs_research
 3. Run `--record` once to populate cache.
 4. Commit the new line **and** the new `cache/*.json` file together.
 
-## Metrics
+## When to extend the dataset
 
-`run_needs_research` reports accuracy / precision / recall / F1, per-category breakdown, and a list of mismatches with their IDs so you can drill into specific failures.
+Add a case whenever:
+- A new bug is found in production (lock in the regression)
+- A prompt change is made that affects a category not yet covered
+- An attack vector is identified (injection, jailbreak, etc.)
+
+Never edit an existing case's expected label silently — if you change a label, note the reason in the case's `notes` field.

@@ -1,0 +1,10 @@
+{
+  "target": "research_brief",
+  "annotator": "project-author",
+  "annotated_at": "2026-05-25",
+  "sampling_strategy": "hand-picked to exercise must_mention / must_not_mention / min_confidence rules, including the single-source-downgrade case from P3",
+  "class_balance_note": "6 cases total; mix of medium-confidence multi-source (3), low-confidence ambiguous (1), irrelevant-results (1), single-source-downgrade (1)",
+  "known_bias": "single annotator, same person tuned the pipeline being evaluated",
+  "inter_annotator_agreement": null,
+  "categories": ["multi_source_factual", "condolence", "breaking_trade", "ambiguous_low_conf", "irrelevant_results", "single_source_downgrade"]
+}

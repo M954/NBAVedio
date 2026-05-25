@@ -11,6 +11,8 @@ import os
 import re
 import httpx
 
+from agents.prompt_safety import wrap_untrusted, UNTRUSTED_SYSTEM_CLAUSE
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -161,6 +163,15 @@ class ResearchAgent:
         return text
 
     def _search(self, query):
+        if os.environ.get("NBAVEDIO_E2E_STUB") == "1":
+            from agents.trace_logger import get_current as _get_trace
+            _tr = _get_trace()
+            if _tr is not None:
+                _tr.event("serpapi_call", query=query, latency_ms=0.0, result_count=2, cache_hit=False)
+            return {"organic_results": [
+                {"title": f"E2E stub result A for {query}", "snippet": "Fixture snippet A.", "link": "https://example.test/a"},
+                {"title": f"E2E stub result B for {query}", "snippet": "Fixture snippet B.", "link": "https://example.test/b"},
+            ]}
         params = {
             "engine": "google",
             "q": query,
@@ -168,10 +179,27 @@ class ResearchAgent:
             "num": max(self.top_n, 5),
             "hl": "en",
         }
-        with httpx.Client(timeout=self.timeout) as client:
-            r = client.get(_ENDPOINT, params=params)
-            r.raise_for_status()
-            return r.json()
+        import time as _t
+        from agents.trace_logger import get_current as _get_trace
+        _t0 = _t.perf_counter()
+        result_count = 0
+        try:
+            with httpx.Client(timeout=self.timeout) as client:
+                r = client.get(_ENDPOINT, params=params)
+                r.raise_for_status()
+                data = r.json()
+            result_count = len(data.get("organic_results") or [])
+            return data
+        finally:
+            _tr = _get_trace()
+            if _tr is not None:
+                _tr.event(
+                    "serpapi_call",
+                    query=query,
+                    latency_ms=round((_t.perf_counter() - _t0) * 1000.0, 2),
+                    result_count=result_count,
+                    cache_hit=False,
+                )
 
     @staticmethod
     def _format_brief(results, char_limit):
@@ -283,17 +311,21 @@ class ResearchAgent:
         if not self.ai or not slim_results:
             return {}, raw_brief
         sources_text = "\n".join(
-            f"[{i}] {r.get('title','')} —— {r.get('snippet','')}  ({r.get('source','')})"
+            f"[{i}] {wrap_untrusted(r.get('title',''), 'search_result')} —— "
+            f"{wrap_untrusted(r.get('snippet',''), 'search_result')}  ({r.get('source','')})"
             for i, r in enumerate(slim_results, 1)
         )
         today_str = datetime.date.today().isoformat()
+        # NOTE: LLM self-rated confidence has weak calibration. Used here as a SOFT signal
+        # (triggers brief truncation when low) — never as a hard gate. See research_agent.py
+        # downgrade logic for the cross-check.
         prompt = (
             "你在帮一个NBA短视频博主从全网搜索结果里筛选相关内容。\n"
             "你的任务【只有筛选 + 一句话总结 + 置信度判断】，不要试图抽取结构化字段，"
             "也不要重写事实——硬事实（对手、场次、比分、伤情）下游会直接读原始 snippet。\n\n"
             f"【时间上下文】今天日期: {today_str}\n"
             f"搜索结果里的日期是真实的，不要因为与你训练数据不符就当成伪造。\n\n"
-            f"原推文（作者: {author or '未知'}）:\n{tweet_text}\n\n"
+            f"原推文（作者:\n{wrap_untrusted(author or '未知', 'author')}）:\n{wrap_untrusted(tweet_text, 'tweet')}\n\n"
             f"全网搜索结果（多来源，质量参差）:\n{sources_text}\n\n"
             "请严格输出一个 JSON 对象（不要 markdown 代码块、不要解释），三个字段：\n"
             "{\n"
@@ -313,7 +345,7 @@ class ResearchAgent:
             "- 不确定就给 medium 或 low，不要硬给 high\n"
         )
         try:
-            raw = self.ai._call(prompt, system="你是一个严谨的检索结果筛选器，只输出合法 JSON。")
+            raw = self.ai._call(prompt, system=UNTRUSTED_SYSTEM_CLAUSE + "\n\n你是一个严谨的检索结果筛选器，只输出合法 JSON。", purpose="research_extract_facts")
             if not raw:
                 return {}, raw_brief
             m = re.search(r"\{[\s\S]*\}", raw)
@@ -344,8 +376,13 @@ class ResearchAgent:
                     seen.add(idx)
                     relevant.append(slim_results[idx - 1])
         # 没挑出任何相关 snippet 但 confidence>=medium 时降级——避免空腹喂下游
+        # Retrieval-side sanity check: if we have no relevant snippets, the LLM's self-rated
+        # confidence is untrustworthy — force it down to "low" so the soft-signal kicks in.
         if not relevant and confidence != "low":
             confidence = "low"
+        # 单一来源 ≠ 高把握：只挑出 1 条相关 snippet 时把 high 压到 medium
+        elif len(relevant) == 1 and confidence == "high":
+            confidence = "medium"
 
         facts = {
             "summary": summary,
